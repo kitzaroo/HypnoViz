@@ -618,7 +618,7 @@ vec3 blendMedia(vec3 pat, vec3 m)
     float lum = dot(pat, vec3(0.299, 0.587, 0.114));
     float mx  = max(pat.r, max(pat.g, pat.b));
     vec3 theme = pat / (mx + 0.02);
-    if (uMBlend == 3)                                                // video only: no spiral, keeps zoom / aberration / flash
+    if (uMBlend == 3)                                                // Video style: no spiral, keeps zoom / aberration / flash
         return m * (0.55 + 0.45 * uMAmt) * (1.0 + 0.45 * uMPulse);
     vec3 mt = m * mix(vec3(1.0), theme, 0.5);                        // tint the footage with the theme colours
     mt *= 1.0 + 0.45 * uMPulse;                                      // flash on the bass
@@ -901,7 +901,7 @@ SETTINGS_KEYS = ("volume", "spot_delay")
 VISUAL_KEYS = ("spin", "zoom", "ab", "beat_smooth", "color", "kzoom", "dom_size", "dom_rate")
 BEAT_KEYS = ("hit_cool", "kick_lo", "kick_hi", "kick_sens", "snare_lo", "snare_hi", "snare_sens")
 MEDIA_KEYS = ("media_calm", "media_peak", "media_speed", "media_flash", "media_sway_amt", "media_rate", "media_pulse")
-BLENDS = ["Spiral window", "Soft overlay", "Glow", "Video only"]
+BLENDS = ["Spiral window", "Soft overlay", "Glow"]
 SL_DIVIDERS = (0, 5, 7)
 
 
@@ -924,7 +924,8 @@ def spring_step(x, v, target, k, c, dt):
 TAU_F = 6.283185307179586
 TIME_WRAP = TAU_F / 0.005
 FLOWK_PERIOD = 2.0 / 0.8660254037844386
-MODES = ["Classic", "Prism", "Neon", "Kaleidoscope", "Psychedelic"]
+MODES = ["Classic", "Prism", "Neon", "Kaleidoscope", "Psychedelic", "Video"]
+VIDEO_MODE = 5            # shows only the media layer (no spiral); keeps playing at its last speed when the audio stops
 
 
 def app_dir():
@@ -1057,6 +1058,8 @@ def load_settings():
                 cfg[k] = v
     except Exception:
         pass
+    if cfg.get("media_blend", 0) not in (0, 1, 2):          # the old "Video only" blend became the Video visual style
+        cfg["media_blend"] = 0
     return cfg
 
 
@@ -1624,8 +1627,12 @@ class Panel:
             w, h = cw * sc, card_h * sc
             fill = 58 if sel else (34 if hover == key else G_CARD)
             box(cx - w / 2, cy - h / 2, w, h, (255, 255, 255, fill), 14)
+            mth = st["media"]
             if prev:
-                img = self.thumb_surface(("sty", k), prev[k], s, iw, ih, 10)
+                if k == VIDEO_MODE and mth.get("loaded"):
+                    img = self.thumb_surface(("vidprev", mth["tid"]), mth["thumb"], s, iw, ih, 10)
+                else:
+                    img = self.thumb_surface(("sty", k), prev[k], s, iw, ih, 10)
                 if abs(sc - 1.0) > 0.002:
                     img = pygame.transform.smoothscale(img, (max(2, int(img.get_width() * sc)), max(2, int(img.get_height() * sc))))
                 surf.blit(img, (int((cx - w / 2 + 6 * sc) * s), int((cy - h / 2 + 6 * sc) * s)))
@@ -2720,6 +2727,7 @@ class MediaLayer:
         self._req = False
         self._focus = None
         self.error = None
+        self._en = True
         self.prefs = load_scene_prefs()      # hidden / deleted scenes per video path (survives restarts)
         self.pver = 0                        # bumps whenever a hide / delete changes
         self._force_t = None
@@ -3054,8 +3062,10 @@ class MediaLayer:
     def update(self, now, dt, enabled, paused, rate):
         if self.cur is None:
             self.vis += (0.0 - self.vis) * (1 - math.exp(-dt * 4.0))
+            self._en = bool(enabled)
             return
         self.vis += ((1.0 if enabled else 0.0) - self.vis) * (1 - math.exp(-dt * 3.0))
+        self._en = bool(enabled)
         halt = paused or not enabled
         for h in (self.cur, self.nxt):
             if h is not None and (h is self.cur or self.state == "fading"):
@@ -3100,9 +3110,13 @@ class MediaLayer:
                 self.fade, self.last_change = 0.0, now
                 self._prepare(now)
 
-    def bind(self, prog, amt, pulse, blend, gain=1.0, sway=(0.0, 0.0, 0.0, 0.0)):
-        """Set the shader's media uniforms and bind the two frame textures (units 5 and 6)."""
-        on = self.cur is not None and self.tex[0] is not None and self.vis > 0.003 and amt > 0.003
+    def bind(self, prog, amt, pulse, blend, gain=1.0, sway=(0.0, 0.0, 0.0, 0.0), solo=False):
+        """Set the shader's media uniforms and bind the two frame textures (units 5 and 6).
+        solo = Video style: while there is any media the picture is always the footage (black while a frame is on its way),
+        so the spiral can never flash up between scenes."""
+        on = self.cur is not None and self.tex[0] is not None and self.vis > 0.003 and (amt > 0.003 or solo)
+        if solo and not on and self.items and self._en:
+            on, amt = True, max(amt, 0.5)
         a = self.tex[0] if self.tex[0] is not None else self.dummy
         fading = self.state == "fading" and self.tex[1] is not None
         b = self.tex[1] if fading else a
@@ -3489,12 +3503,15 @@ class App:
         for m in range(len(MODES)):
             for name, val in (("uRes", (float(w), float(h))), ("uRot", 0.9), ("uFlow", 0.3), ("uFlowK", 0.8), ("uZoom", 0.0),
                               ("uAb", 0.004), ("uBass", 0.15), ("uMid", 0.3), ("uHigh", 0.2), ("uEnergy", 0.5), ("uHue", 0.1),
-                              ("uTime", 7.0 + m), ("uPsyT", 7.0 + m), ("uWarp", 0.06), ("uDim", 1.0), ("uMode", m), ("uMOn", 0.0)):
+                              ("uTime", 7.0 + m), ("uPsyT", 7.0 + m), ("uWarp", 0.06), ("uDim", 1.0), ("uMode", m if m != VIDEO_MODE else 0), ("uMOn", 0.0)):
                 if name in self.prog:
                     self.prog[name].value = val
             self.vao.render(moderngl.TRIANGLE_STRIP)
             raw = np.frombuffer(fbo.read(components=3), dtype=np.uint8).reshape(h, w, 3)
-            out.append(np.ascontiguousarray(raw[::-1]))
+            img = np.ascontiguousarray(raw[::-1])
+            if m == VIDEO_MODE:
+                img = np.zeros_like(img)                 # Video card: black until a clip's thumbnail takes its place
+            out.append(img)
         fbo.release()
         self.style_prev = out
 
@@ -3533,6 +3550,8 @@ class App:
             if n == name:
                 for k, v in vals.items():
                     self.cfg[k] = v
+                if self.cfg.get("media_blend", 0) not in (0, 1, 2):
+                    self.cfg["media_blend"] = 0
                 for k in ("kick_lo", "kick_hi", "snare_lo", "snare_hi"):
                     self.fix_pairs(k)
                 self.preset_sel = name
@@ -4207,6 +4226,10 @@ class App:
             # ---- motion ----
             idle = False if spot else a.data is None
             playing = bool(cap and cap.active) if spot else a.playing
+            vid = cfg["mode"] == VIDEO_MODE                          # Video style: only the footage, never idles with the spiral
+            rms = 0.0 if chunk is None else float(np.sqrt(np.mean(np.square(chunk))))
+            self.quiet_t = 0.0 if rms > 0.0015 else getattr(self, "quiet_t", 0.0) + dt
+            live = playing and self.quiet_t < 0.8                    # audio is actually coming in (not paused / stopped / silent)
             dom = cfg["domination"]
             sm = cfg["beat_smooth"]                                  # 0 = raw & snappy ... 1 = very soft / flowing
             s_bass = self.smooth("bass", ana.bass, dt, sm)
@@ -4307,14 +4330,21 @@ class App:
             self.m_burst = getattr(self, "m_burst", 0.0)
             self.m_burst = max(self.m_burst * math.exp(-dt * 6.5 / (1.0 + 2.0 * sm)), hit) if playing else self.m_burst * math.exp(-dt * 6.5 / (1.0 + 2.0 * sm))
             S = cfg["media_speed"]
-            vo = cfg["media_blend"] == 3                                   # video only: calm parts crawl almost to a stop
+            vo = vid                                                       # Video style: calm parts crawl almost to a stop
             sp_calm, sp_peak = max(0.05, 1.0 - (0.85 if vo else 0.55) * S), 1.0 + 3.2 * S
             self.m_speed = getattr(self, "m_speed", 1.0)
-            self.m_speed += ((sp_calm + (sp_peak - sp_calm) * self.m_burst) - self.m_speed) * (1 - math.exp(-dt * ((45.0 / (1.0 + 8.0 * sm)) if self.m_burst > 0.05 else 9.0)))
+            self.m_avg = getattr(self, "m_avg", 1.0)                       # ~1.5 s running average of the speed while audio plays
+            if vid and not live:                                           # no audio: keep moving at the last known speed until it returns
+                self.m_speed += (max(0.5, self.m_avg) - self.m_speed) * (1 - math.exp(-dt * 2.0))
+            else:
+                self.m_speed += ((sp_calm + (sp_peak - sp_calm) * self.m_burst) - self.m_speed) * (1 - math.exp(-dt * ((45.0 / (1.0 + 8.0 * sm)) if self.m_burst > 0.05 else 9.0)))
+                if live and rms > 0.0015:
+                    self.m_avg += (self.m_speed - self.m_avg) * (1 - math.exp(-dt / 1.5))
             mdl.set_speed(self.m_speed)
-            mdl.update(now, dt, cfg["media_on"], (not playing and not idle), cfg["media_rate"])
+            mdl.update(now, dt, cfg["media_on"], (not playing and not idle) and not vid, cfg["media_rate"])
             warp = 0.02 + 0.13 * s_mid + 0.05 * s_high
-            target_dim = 0.6 if idle else (1.0 if playing else 0.5)
+            vid_blank = vid and (not mdl.items or not cfg["media_on"])        # Video style with nothing to show: plain black, no spiral
+            target_dim = 0.0 if vid_blank else (1.0 if vid else (0.6 if idle else (1.0 if playing else 0.5)))
             self.dim += (target_dim - self.dim) * (1 - math.exp(-dt * 5))
 
             # ---- menu animation (0 = closed, 1 = open) ----
@@ -4347,12 +4377,14 @@ class App:
                 ("uZoom", zoom),
                 ("uAb", ab), ("uBass", float(ubass)), ("uMid", float(s_mid)),
                 ("uHigh", float(s_high)), ("uEnergy", float(s_energy)), ("uHue", self.hue % 4.0), ("uPsyT", float(self.psy_t)), ("uHueWave", (min(1.0, cfg["color"] / 3.0), float(self.wave_ph))),
-                ("uTime", now % TIME_WRAP), ("uWarp", warp), ("uDim", self.dim), ("uMode", cfg["mode"]),
+                ("uTime", now % TIME_WRAP), ("uWarp", warp), ("uDim", self.dim), ("uMode", 0 if vid else cfg["mode"]),
             ):
                 if name in self.prog:            # the GLSL compiler drops unused uniforms
                     self.prog[name].value = val
             amt = (cfg["media_calm"] + (cfg["media_peak"] - cfg["media_calm"]) * self.m_env) if cfg["media_auto"] else cfg["media_peak"]
-            mdl.bind(self.prog, amt, s_bass * cfg["media_pulse"], cfg["media_blend"], flash_gain, sway_v)
+            if vid and not live:
+                amt = cfg["media_peak"]                                    # no audio: the footage stays at full brightness
+            mdl.bind(self.prog, amt, s_bass * cfg["media_pulse"], 3 if vid else min(2, cfg["media_blend"]), flash_gain, sway_v, solo=vid)
             self.vao.render(moderngl.TRIANGLE_STRIP)
 
             # ---- domination popups (bass-triggered) ----
@@ -4393,6 +4425,10 @@ class App:
                     alpha = 0.55 + 0.35 * math.sin(now * 1.6)
                 elif spot:
                     pass
+                elif vid_blank and now - self.toast_t >= 3.2:
+                    lines, alpha = [("Add Media To Begin" if not mdl.items else "Media layer is off", 40)], 0.55 + 0.35 * math.sin(now * 1.6)
+                elif vid and mdl.items and now - self.toast_t >= 3.2:
+                    pass                                                  # Video style: just the footage, no idle / paused captions
                 elif idle and not a.loading:
                     lines = [("Drop a music file to begin", 40)]
                     if cfg["help"]:
