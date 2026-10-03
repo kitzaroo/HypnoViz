@@ -17,7 +17,7 @@ A trippy music visualizer for Windows. Drop in a song and a spiral reacts to the
 | Internet | Only for the first install, to download the Python packages |
 
 The Python packages are listed in `requirements.txt` and are installed for you automatically:
-`pygame`, `moderngl`, `numpy`, `miniaudio`, `sounddevice`, `opencv-python`, `Pillow`, `av` and `proc-tap` (Windows only, used by Spotify Mode).
+`pygame`, `moderngl`, `numpy`, `miniaudio`, `sounddevice`, `opencv-python`, `Pillow`, `av` and, on Windows only for Spotify Mode, `proc-tap`, `pycaw` (Spotify volume) and `winrt-*` (Spotify progress bar and seeking).
 
 You do **not** need conda, ffmpeg or anything else. Everything is installed into a private virtual environment (`.venv`) inside the project folder, so nothing touches your system Python.
 
@@ -46,7 +46,7 @@ If something goes wrong, the console window stays open and shows the error. The 
 
 1. Run `run.bat` and drag a music file (mp3, wav, flac, ogg, m4a, aac, opus, ...) onto the window.
 2. Drag videos, GIFs or images onto the window as well to add them to the media stack.
-3. Press **Esc** to open the menu: Queue, Visuals, Media, Stack, Scenes, Beat and Settings.
+3. Press **Esc** to open the menu (a player bar at the bottom has the song, transport, seek bar and volume; in Spotify Mode it shows the album art and controls Spotify, and the glass Spotify button switches the mode on and off): Queue, Visuals, Scenes, Beat and Settings (Visuals has the style cards, a live preview, motion and media-effect sliders, and the media clip and stack, each in a collapsible section).
 
 | Key | Action |
 |---|---|
@@ -55,6 +55,10 @@ If something goes wrong, the console window stays open and shows the error. The 
 | F or F11 | Fullscreen |
 | M or Tab | Next visual style |
 | V | Next media scene |
+| X | Hide the scene on screen (it never plays again) |
+| Delete | Delete the scene on screen |
+| Z | Undo the last hide / delete |
+| Mouse wheel (Esc > Visuals) | Scroll the page; Ctrl + wheel over a slider nudges it |
 | D | Domination Mode |
 | S | Spotify Mode |
 | N / P | Next / previous track |
@@ -80,4 +84,4 @@ Replace the files with the new version (or `git pull`) and run `run.bat` again. 
 - **"Could not create the virtual environment"**: Python isn't installed or isn't on your PATH. See step 1 above.
 - **Videos don't play**: make sure the packages finished installing. Delete the `.venv` folder and run `run.bat` again to reinstall.
 - **Spotify Mode hears nothing**: it listens to the Spotify desktop app only, so Spotify must be open and playing.
-- **Slow with big videos**: turn off **Smooth video** in the Media tab.
+- **Slow with big videos**: turn off **Smooth video** in Visuals > Motion & effects (Media effects).

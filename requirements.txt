@@ -7,3 +7,8 @@ opencv-python
 Pillow
 proc-tap; sys_platform == "win32"
 av
+pycaw; sys_platform == "win32"
+winrt-runtime; sys_platform == "win32"
+winrt-Windows.Foundation; sys_platform == "win32"
+winrt-Windows.Foundation.Collections; sys_platform == "win32"
+winrt-Windows.Media.Control; sys_platform == "win32"

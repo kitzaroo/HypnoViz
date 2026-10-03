@@ -14,7 +14,10 @@ Keys
   N / P        next / previous     H     show / hide help
   S            Spotify Mode (hears only Spotify.exe, via WASAPI process loopback)
   V            jump to the next scene of the media layer
-  Drop a video / GIF / image to blend it into the visuals (Esc > Media)
+  X / Delete   hide / delete the scene on screen (Z undoes)
+  Esc > Scenes click a scene to preview it, drag the trim handles to shorten / lengthen it
+  Esc > Visuals: collapsible sections (style, live preview, motion, media); wheel scrolls (Ctrl+wheel nudges a slider)
+  Drop a video / GIF / image to blend it into the visuals (Esc > Visuals > Media & stack)
   Q            quit
 """
 import os
@@ -39,7 +42,6 @@ except Exception:  # ffmpeg fallback still works without it
     miniaudio = None
 
 SR = 44100
-SR_NOMINAL = 44100
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus", ".wma", ".mka"}
 
 
@@ -337,8 +339,11 @@ class Analyzer:
             v = np.array([math.sqrt(float(np.mean(spec[e[i]:max(e[i + 1], e[i] + 1)] ** 2))) for i in range(48)])
             self.vpk = max(float(v.max()), self.vpk * math.exp(-dt * 0.3), 1e-4)
             tgt = (v / self.vpk) ** 0.6
-            self.vis_env = np.where(tgt > self.vis_env, self.vis_env + (tgt - self.vis_env) * 0.6, self.vis_env * math.exp(-dt * 9.0))
-            self.vis_bars = tuple(int(x * 24 + 0.5) for x in self.vis_env)
+            pad = np.concatenate(([tgt[0]], tgt, [tgt[-1]]))
+            tgt = 0.25 * pad[:-2] + 0.5 * pad[1:-1] + 0.25 * pad[2:]            # blend neighbouring bars: no single-bar spikes
+            k = np.where(tgt > self.vis_env, 1 - math.exp(-dt * 26.0), 1 - math.exp(-dt * 5.0))   # quick rise, gentle fall (frame-rate independent)
+            self.vis_env = self.vis_env + (tgt - self.vis_env) * k
+            self.vis_bars = tuple(round(float(x) * 24.0, 2) for x in self.vis_env)
         if (is_kick or is_onset) and now - self.last_beat > 0.16:
             self.last_beat = now
             self.beat = min(1.0, 0.5 + 0.9 * max(trans, onset * 0.7))
@@ -689,6 +694,61 @@ void main(){ vec4 c = texture(uTex, vUV); fragColor = vec4(c.rgb, c.a * uAlpha);
 
 
 
+PBLUR_FRAG = """
+#version 330
+uniform sampler2D uTex;
+uniform vec2  uPx;       // blur radius in uv units
+uniform float uAlpha;
+in vec2 vUV;
+out vec4 fragColor;
+void main(){
+    vec4 acc = vec4(0.0);
+    const int N = 32;
+    for (int i = 0; i < N; i++) {                      // golden-angle disc; alpha-weighted so the edges don't darken
+        float r = sqrt((float(i) + 0.5) / float(N));
+        float a = float(i) * 2.39996323;
+        vec4 c = texture(uTex, vUV + vec2(cos(a), sin(a)) * r * uPx);
+        acc += vec4(c.rgb * c.a, c.a);
+    }
+    acc /= float(N);
+    fragColor = vec4(acc.rgb / max(acc.a, 1e-4), acc.a * uAlpha);
+}
+"""
+
+PREV_FRAG = """
+#version 330
+uniform sampler2D uTex;
+uniform vec2  uSize;     // preview size, px
+uniform float uRad;      // corner radius, px
+uniform float uAlpha;
+uniform int   uFlip;     // 1: the texture is a decoded frame (row 0 = top)
+uniform float uBlur;     // blur radius in px (tab switches)
+in vec2 vUV;
+out vec4 fragColor;
+void main(){
+    vec2 p = (vUV - 0.5) * uSize;
+    vec2 q = abs(p) - uSize * 0.5 + uRad;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - uRad;
+    float m = 1.0 - smoothstep(-0.8, 0.8, d);
+    vec2 uv = uFlip == 1 ? vec2(vUV.x, 1.0 - vUV.y) : vUV;
+    vec3 c;
+    if (uBlur > 0.3) {
+        c = vec3(0.0);
+        for (int i = 0; i < 24; i++) {
+            float r = sqrt((float(i) + 0.5) / 24.0);
+            float a = float(i) * 2.39996323;
+            c += texture(uTex, uv + vec2(cos(a), sin(a)) * r * uBlur / uSize).rgb;
+        }
+        c /= 24.0;
+    } else {
+        c = texture(uTex, uv).rgb;
+    }
+    float rim = 1.0 - smoothstep(0.0, 1.6, abs(d + 1.0));
+    c = mix(c, vec3(1.0), rim * 0.35);
+    fragColor = vec4(c, m * uAlpha);
+}
+"""
+
 RECT_VERT = """
 #version 330
 uniform vec2 uCenter;   // NDC centre
@@ -869,6 +929,7 @@ DEFAULTS = dict(
     media_path="", media_paths="", media_remember=False, media_on=True, media_blend=0, media_calm=0.40, media_peak=1.0, media_auto=True, media_speed=1.0, media_rate=1.0, media_pulse=1.0,
     beat_smooth=0.35, media_flash=0.0, media_smooth=True, media_sway=False, media_sway_amt=1.0, media_hit=False, media_style=0, hit_cool=1.0,
     kick_lo=30.0, kick_hi=150.0, kick_sens=1.0, snare_lo=170.0, snare_hi=420.0, snare_sens=1.0,
+    vis_open="style,preview,motion",
 )
 
 SLIDERS = [  # key, label, min, max   (grouped: dividers are drawn after rows 0, 5 and 7)
@@ -897,12 +958,11 @@ SLIDERS = [  # key, label, min, max   (grouped: dividers are drawn after rows 0,
     ("snare_hi", "Snare range \u2013 high", 200.0, 1200.0),
     ("snare_sens", "Snare sensitivity", 0.4, 2.5),
 ]
-SETTINGS_KEYS = ("volume", "spot_delay")
+SETTINGS_KEYS = ("spot_delay",)
 VISUAL_KEYS = ("spin", "zoom", "ab", "beat_smooth", "color", "kzoom", "dom_size", "dom_rate")
 BEAT_KEYS = ("hit_cool", "kick_lo", "kick_hi", "kick_sens", "snare_lo", "snare_hi", "snare_sens")
 MEDIA_KEYS = ("media_calm", "media_peak", "media_speed", "media_flash", "media_sway_amt", "media_rate", "media_pulse")
 BLENDS = ["Spiral window", "Soft overlay", "Glow"]
-SL_DIVIDERS = (0, 5, 7)
 
 
 def slider_norm(key, v):
@@ -953,8 +1013,16 @@ def load_scene_prefs():
         for p, v in raw.items():
             off = [float(x) for x in v.get("off", []) if isinstance(x, (int, float))]
             dl = [float(x) for x in v.get("del", []) if isinstance(x, (int, float))]
-            if off or dl:
-                out[str(p)] = {"off": off, "del": dl}
+            tr = []
+            for x in v.get("trim", []):
+                try:
+                    t0, a0, b0 = (float(q) for q in x)
+                    if b0 - a0 >= 0.1:
+                        tr.append([t0, a0, b0])
+                except Exception:
+                    pass
+            if off or dl or tr:
+                out[str(p)] = {"off": off, "del": dl, "trim": tr}
         return out
     except Exception:
         return {}
@@ -965,7 +1033,7 @@ def save_scene_prefs(prefs):
         p = scenes_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
-            json.dump({k: v for k, v in prefs.items() if v["off"] or v["del"]}, f, indent=1)
+            json.dump({k: v for k, v in prefs.items() if v["off"] or v["del"] or v.get("trim")}, f, indent=1)
     except Exception:
         pass
 
@@ -974,7 +1042,7 @@ def _has(lst, t):
     return any(abs(x - t) <= SCENE_TOL for x in lst)
 
 
-PRESET_SKIP = {"media_remember", "volume", "spotify", "media_path", "media_paths", "fs_kind", "spot_delay", "help"}
+PRESET_SKIP = {"vis_open", "media_remember", "volume", "spotify", "media_path", "media_paths", "fs_kind", "spot_delay", "help"}
 
 
 def presets_path():
@@ -1141,6 +1209,214 @@ def send_media_key(vk):
             u.keybd_event(vk, 0, 2, 0)
         except Exception:
             pass
+
+
+def fetch_album_art(title):
+    """Album art for a Spotify window title 'Artist - Song' via the public iTunes search (no key). Returns a PIL image or None."""
+    import urllib.request, urllib.parse, json as _json, io, re
+    from PIL import Image
+    if " - " not in title:
+        return None
+    artist, song = title.split(" - ", 1)
+    clean = lambda t: re.sub(r"[\(\[].*?[\)\]]", "", t).strip().lower()
+    q = urllib.parse.quote(f"{artist} {clean(song)}")
+    hdr = {"User-Agent": "Hypnosis/1.0"}
+    with urllib.request.urlopen(urllib.request.Request(f"https://itunes.apple.com/search?term={q}&entity=song&limit=8", headers=hdr), timeout=6) as r:
+        res = _json.loads(r.read().decode("utf-8", "replace")).get("results", [])
+    pick = None
+    for it in res:
+        if clean(it.get("trackName", "")) == clean(song) and clean(artist.split(",")[0]) in it.get("artistName", "").lower():
+            pick = it
+            break
+    pick = pick or next((it for it in res if clean(song) in it.get("trackName", "").lower()), None) or (res[0] if res else None)
+    if not pick or not pick.get("artworkUrl100"):
+        return None
+    url = pick["artworkUrl100"].replace("100x100bb", "300x300bb")
+    with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=8) as r:
+        return Image.open(io.BytesIO(r.read())).convert("RGB")
+
+
+_SPOT_BASE = None
+
+
+def spot_icon_base():
+    """(luma, mask) of the Spotify button picture: spotify_icon.png next to the program (the glassy disc is cropped out of its black
+    background); without the file a plain glassy disc with a sound-wave is used. Both 128x128 float arrays 0..1."""
+    global _SPOT_BASE
+    if _SPOT_BASE is not None:
+        return _SPOT_BASE
+    from PIL import Image
+    N = 128
+    yy, xx = np.mgrid[0:N, 0:N].astype(np.float32)
+    r = np.hypot(xx - N / 2 + 0.5, yy - N / 2 + 0.5) / (N / 2)
+    try:
+        im = Image.open(os.path.join(app_dir(), "spotify_icon.png")).convert("RGB")
+        a = np.asarray(im).astype(np.float32)
+        lum = a.mean(2)
+        ys, xs = np.where(lum > 14)
+        cx, cy = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2
+        rad = max(xs.max() - xs.min(), ys.max() - ys.min()) / 2 + 2
+        crop = im.crop((int(cx - rad), int(cy - rad), int(cx + rad), int(cy + rad))).resize((N, N), Image.LANCZOS)
+        L = np.asarray(crop).astype(np.float32).mean(2) / 255.0
+        mask = np.clip((1.0 - r) * (N / 2) / 1.5, 0.0, 1.0)
+        L = np.clip(L * 1.6 + 0.10, 0.0, 1.0)
+    except Exception:
+        mask = np.clip((1.0 - r) * (N / 2) / 1.5, 0.0, 1.0)
+        L = 0.22 + 0.55 * np.clip((r - 0.82) / 0.18, 0.0, 1.0) + 0.12 * (1.0 - yy / N)
+        for k, h in enumerate((0.25, 0.45, 0.65, 0.45, 0.25)):
+            x0 = N * (0.28 + k * 0.11)
+            bar = (np.abs(xx - x0) < 4.0) & (np.abs(yy - N / 2) < N * h / 2)
+            L = np.where(bar, 0.78, L)
+        L = np.clip(L, 0.0, 1.0)
+    _SPOT_BASE = (L.astype(np.float32), mask.astype(np.float32))
+    return _SPOT_BASE
+
+
+def spot_icon_pixels(px, to_on, prog):
+    """The Spotify button as RGBA bytes: grey when off, green when on; while prog (0..1) runs a colourful wave sweeps across
+    the glass from the old colour to the new one."""
+    from PIL import Image
+    L0, M0 = spot_icon_base()
+    L = np.asarray(Image.fromarray((L0 * 255).astype(np.uint8)).resize((px, px), Image.LANCZOS)).astype(np.float32) / 255.0
+    M = np.asarray(Image.fromarray((M0 * 255).astype(np.uint8)).resize((px, px), Image.LANCZOS)).astype(np.float32) / 255.0
+    green, grey = np.array([30, 215, 96], np.float32), np.array([138, 140, 152], np.float32)
+    lit = (0.30 + 1.15 * L)[..., None]
+    hi = (255.0 * np.clip(L - 0.72, 0.0, 1.0) * 1.1)[..., None]
+
+    def tint(c):
+        return np.clip(c[None, None, :] * lit + hi, 0, 255)
+
+    new, old = (green, grey) if to_on else (grey, green)
+    if prog is None:
+        rgb = tint(new if to_on else grey) if to_on else tint(grey)
+        alpha = M * (1.0 if to_on else 0.82)
+    else:
+        v, u = np.mgrid[0:px, 0:px].astype(np.float32) / max(1, px - 1)
+        d = u * 0.75 + (1.0 - v) * 0.25 + 0.10 * np.sin(v * 9.0 + prog * 14.0)
+        f = -0.28 + prog * 1.56
+        m = np.clip((d - (f - 0.12)) / 0.24, 0.0, 1.0)
+        m = m * m * (3 - 2 * m)                                   # 1 = wave not here yet (old colour), 0 = passed (new colour)
+        band = np.exp(-(((d - f) / 0.17) ** 2))
+        h = (d * 2.2 + prog * 2.5) % 1.0
+        rainbow = np.stack([np.clip(np.abs(h * 6 - 3) - 1, 0, 1), np.clip(2 - np.abs(h * 6 - 2), 0, 1), np.clip(2 - np.abs(h * 6 - 4), 0, 1)], -1) * 255.0
+        base = tint(old) * m[..., None] + tint(new) * (1 - m[..., None])
+        glow = np.clip(rainbow * lit + hi, 0, 255)
+        rgb = base * (1 - 0.85 * band[..., None]) + glow * (0.85 * band[..., None])
+        a0, a1 = (0.82, 1.0) if to_on else (1.0, 0.82)
+        alpha = M * (a1 * (1 - m) + a0 * m)
+    out = np.dstack([rgb, alpha[..., None] * 255.0]).astype(np.uint8)
+    return out.tobytes()
+
+
+class SmtcSpotify:
+    """Spotify's playback position and seeking through Windows' media session (the same thing the volume flyout shows).
+    Needs the winrt packages; without them ok stays False and the bar stays read-only."""
+
+    def __init__(self, active, on_missing):
+        self.active, self.on_missing = active, on_missing
+        self.ok = None                     # None = not tried yet, True = connected, False = unavailable
+        self.dur = None                    # track length in seconds (None = unknown)
+        self.base, self.stamp, self.playing = 0.0, 0.0, False
+        self._target = None                # queued seek (seconds)
+        self.hold = 0.0                    # ignore the polled position until then (a seek is on its way)
+        self.thread = None
+
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._thread, daemon=True)
+            self.thread.start()
+
+    def position(self):
+        if self.dur is None:
+            return None
+        p = self.base + ((time.perf_counter() - self.stamp) if self.playing else 0.0)
+        return max(0.0, min(self.dur, p))
+
+    def seek(self, t):
+        if self.dur:
+            t = max(0.0, min(self.dur, t))
+            self.base, self.stamp, self.hold = t, time.perf_counter(), time.perf_counter() + 1.5
+            self._target = t
+
+    def _thread(self):
+        import asyncio
+        try:
+            asyncio.run(self._run())
+        except Exception as ex:
+            self.ok = False
+            log(f"SMTC thread ended: {ex}")
+
+    async def _run(self):
+        import asyncio
+        from datetime import datetime, timezone
+        try:
+            from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as Mgr
+            mgr = await Mgr.request_async()
+        except Exception as ex:
+            self.ok = False
+            log(f"SMTC unavailable: {ex}")
+            self.on_missing()
+            return
+        self.ok = True
+        warned = False
+        while True:
+            try:
+                if not self.active():
+                    self.dur = None
+                    await asyncio.sleep(0.6)
+                    continue
+                ses = None
+                for s_ in mgr.get_sessions():
+                    if "spotify" in (s_.source_app_user_model_id or "").lower():
+                        ses = s_
+                if ses is None:
+                    self.dur = None
+                else:
+                    if self._target is not None:
+                        t, self._target = self._target, None
+                        await ses.try_change_playback_position_async(int(t * 10_000_000))
+                    tl = ses.get_timeline_properties()
+                    start, end = tl.start_time.total_seconds(), tl.end_time.total_seconds()
+                    playing = int(ses.get_playback_info().playback_status) == 4          # Playing
+                    pos = tl.position.total_seconds() - start
+                    if playing:
+                        age = (datetime.now(timezone.utc) - tl.last_updated_time).total_seconds()
+                        pos += max(0.0, min(age, 30.0))
+                    if end - start > 1.0:
+                        self.dur = end - start
+                        if time.perf_counter() >= self.hold:
+                            self.base, self.stamp = pos, time.perf_counter()
+                        self.playing = playing
+                    else:
+                        self.dur = None
+            except Exception as ex:
+                if not warned:
+                    warned = True
+                    log(f"SMTC poll failed: {ex}")
+            await asyncio.sleep(0.25)
+
+
+
+
+def spotify_session_volume(set_to=None):
+    """Spotify's own volume in the Windows mixer (needs pycaw). Reads it (or sets it when set_to is given).
+    Returns the volume 0..1, or None when Spotify has no audio session yet (it appears once Spotify plays something)."""
+    if sys.platform != "win32":
+        return None
+    from pycaw.pycaw import AudioUtilities
+    out = None
+    for ses in AudioUtilities.GetAllSessions():
+        try:
+            p = ses.Process
+            if p is None or p.name().lower() != "spotify.exe":
+                continue
+            vol = ses.SimpleAudioVolume
+            if set_to is not None:
+                vol.SetMasterVolume(float(max(0.0, min(1.0, set_to))), None)
+            out = float(vol.GetMasterVolume())
+        except Exception:
+            continue
+    return out
 
 
 def find_spotify_window():
@@ -1483,13 +1759,66 @@ class GlitchText:
 
 # --------------------------------------------------------------------------- menu panel
 PW, PH = 840, 660
+HDR_Y, FTR_Y = 64, 584                     # the Visuals page scrolls between the header line and the footer line
+PREV_W = 420                                # live preview width on the Visuals tab (logical px)
+
+
+SEC_HDR_H, SEC_GAP, SEC_PAD = 38, 8, 8        # Visuals page: section header height, gap between sections, space above a section's content
+VIS_SECTIONS = (("style", "Visual style"), ("preview", "Live preview"), ("motion", "Motion & effects"), ("media", "Media & stack"))
+MEDIA_H = 592                                   # height of the Media & stack content
+MFX_H, MSEP_H = 352, 46                         # the "Media effects" block inside Motion & effects, and the divider above it
+CARD_H = 101
+
+
+def visuals_layout(aspect, anim=None):
+    """The Visuals page: collapsible sections stacked from the top. anim = {name: 0..1} (how far each one is open).
+    Each section: hy (header top), ct (content top), ch (full content height), vis (visible content height), plus the scroll range."""
+    ph = int(max(170, min(270, PREV_W * aspect)))
+    full = dict(style=CARD_H + 4, preview=ph + 12, motion=len(VISUAL_KEYS) * SL_PITCH + 12 + MSEP_H + MFX_H, media=MEDIA_H)
+    out, y = {}, 72.0
+    for name, _ in VIS_SECTIONS:
+        a = 1.0 if anim is None else max(0.0, min(1.0, anim.get(name, 1.0)))
+        out[name] = dict(hy=y, ct=y + SEC_HDR_H + SEC_PAD, ch=full[name], a=a, vis=a * (full[name] + SEC_PAD))
+        y += SEC_HDR_H + a * (full[name] + SEC_PAD) + SEC_GAP
+    out["ph"] = ph
+    out["end"] = y
+    out["max_scroll"] = max(0, int(math.ceil(y - FTR_Y + 4)))
+    return out
+
+
+PREV_MINI = 0.42                                 # size of the preview once it floats along with the scroll
+
+
+def preview_geom(lay, vscroll):
+    """Where the Live preview sits (logical px): in its section, or - once scrolled past - docked at the top right, never above its section.
+    Returns x, y, w, h and f (0 = in place, 1 = fully docked)."""
+    L = lay["preview"]
+    y_n = L["ct"] + 4 - vscroll
+    line = HDR_Y + 8
+    d = line - y_n
+    w, h = float(PREV_W), float(lay["ph"])
+    if d <= 0:
+        return (PW - w) / 2, y_n, w, h, 0.0
+    t = min(1.0, d / (h * 0.7))
+    f = t * t * (3 - 2 * t)
+    w2, h2 = w * (1 - (1 - PREV_MINI) * f), h * (1 - (1 - PREV_MINI) * f)
+    xc, xr = (PW - w) / 2, PW - 28 - w * PREV_MINI
+    return xc + (xr - xc) * f, line, w2, h2, f
+
+
 STACK_ROWS, STACK_ROW_H = 6, 46
 SCN_Y, SCN_ROWS, SCN_ROW_H = 128, 8, 46
+SCN_PV = (24, 128, 388, 218)               # Scenes tab: preview window (logical px)
+TRK_X0, TRK_W, TRK_Y = 40, 360, 412        # trim slider track
+LIST_X, LIST_W = 424, 392                  # Scenes tab: the scene list (one column)
+TRIM_MIN = 0.3
 TRACK_X0, TRACK_W = 262, 400           # slider track (logical px)
-SL_Y0, SL_PITCH, SL_PAD, SL_R = 280, 33, 14, 11.0   # first slider row, row height, thumb overhang, thumb radius
+SL_PITCH, SL_PAD, SL_R = 33, 14, 11.0   # slider row height, thumb overhang, thumb radius
 SS = 3                                  # supersampling for slider artwork
-SEEK_X0, SEEK_W = 40, 760
-ROW_H, LIST_Y, LIST_ROWS = 40, 236, 7
+SEEK_X0, SEEK_W = 312, 216               # now-playing bar: seek track (centered on the panel)
+VOL_X0, VOL_W = 622, 100                 # now-playing bar: volume track
+ART = 60                                 # Spotify album art size in the bar
+ROW_H, LIST_Y, LIST_ROWS = 40, 98, 10
 
 WHITE = (255, 255, 255)
 DARK = (24, 24, 34)
@@ -1514,6 +1843,9 @@ class Panel:
         self.fonts = {}
         self.hits = []
         self.sl_cache = {}
+        self.sp_icons = {}
+        self.art_surf = None
+        self.icon_cache = {}
 
     @staticmethod
     def scale(W, H):
@@ -1608,8 +1940,87 @@ class Panel:
         text("Shaded bands = what the detector listens to \u2013 tune until KICK / SNARE flash only on the real drums.", 28, 536, 13, WHITE, al=DIM_AL)
         text("Lower sensitivity if hats or vocals trigger it, raise it if hits are missed.", 28, 558, 13, WHITE, al=DIM_AL)
 
-    def visuals_tab(self, st, hover, press, s, surf, hits, text, box, draw_sliders, cfg):
-        text("VISUAL STYLE", 28, 74, 13, WHITE, True, al=DIM_AL)
+    def visuals_tab(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, draw_sliders, cfg):
+        """Collapsible sections (they open / close with an eased height); everything scrolls under the header."""
+        sy = -st.get("vscroll", 0.0)
+        anim = st.get("sec_a") or {}
+        lay = visuals_layout(st.get("aspect", 0.5625), anim)
+        opened = set(filter(None, cfg.get("vis_open", "").split(",")))
+        top_c, bot_c = HDR_Y, FTR_Y
+
+        def clip_to(y0, y1):
+            y0, y1 = max(top_c, y0), min(bot_c, y1)
+            surf.set_clip(R_(0, y0, PW, max(0.0, y1 - y0), s))
+            return y0, y1
+
+        def keep(n0, y0, y1):
+            kept = []
+            for (hx, hy, hw, hh), hk in hits[n0:]:
+                a, b = max(hy, y0), min(hy + hh, y1)
+                if b > a:
+                    kept.append(((hx, a, hw, b - a), hk))
+            hits[n0:] = kept
+
+        mi = st["media"]
+        summary = {"style": MODES[cfg["mode"]] if 0 <= cfg["mode"] < len(MODES) else "",
+                   "preview": "mirrors the screen", "motion": f"{len(VISUAL_KEYS) + len(MEDIA_KEYS)} settings",
+                   "media": ((mi.get("name") or "")[:34] if mi.get("loaded") else "no media") + ("  \u00b7  on" if cfg["media_on"] else "  \u00b7  off")}
+        for name, title in VIS_SECTIONS:
+            L = lay[name]
+            hy, ct, a = L["hy"] + sy, L["ct"] + sy, L["a"]
+            # ---- header
+            n0 = len(hits)
+            y0, y1 = clip_to(HDR_Y, FTR_Y)
+            key = ("sec", name)
+            hov = hover == key
+            box(24, hy, 792, SEC_HDR_H, (255, 255, 255, G_HOVER if hov else G_CARD), 14)
+            ang = a * math.pi / 2                                           # chevron: points right when closed, down when open
+            cx_, cy_ = 46.0, hy + SEC_HDR_H / 2
+            pts = []
+            for px_, py_ in ((-4.5, -6.0), (-4.5, 6.0), (6.0, 0.0)):
+                pts.append((int((cx_ + px_ * math.cos(ang) - py_ * math.sin(ang)) * s), int((cy_ + px_ * math.sin(ang) + py_ * math.cos(ang)) * s)))
+            pygame.draw.polygon(surf, (255, 255, 255, 230), pts)
+            text(title.upper(), 66, hy, 13, WHITE, True, vh=SEC_HDR_H)
+            text(summary[name], 800, hy, 12, WHITE, False, "r", vh=SEC_HDR_H, al=DIM_AL, maxw=420)
+            hits.append(((24, hy, 792, SEC_HDR_H), key))
+            keep(n0, y0, y1)
+            if a <= 0.002:
+                continue
+            # ---- content, clipped to the part of the section that is open
+            n0 = len(hits)
+            y0, y1 = clip_to(hy + SEC_HDR_H, hy + SEC_HDR_H + L["vis"])
+            if y1 <= y0:
+                continue
+            if name == "style":
+                self.style_section(st, hover, press, s, surf, hits, text, box, cfg, ct)
+            elif name == "preview":
+                px = (PW - PREV_W) / 2
+                box(px - 4, ct - 0, PREV_W + 8, lay["ph"] + 8, (0, 0, 0, int(110 * (1.0 - preview_geom(lay, st.get("vscroll", 0.0))[4]))), 16)             # frame; the GL pass draws the live picture on top
+            elif name == "motion":
+                draw_sliders(VISUAL_KEYS, ct + 4, (3, 5))
+                sep = ct + 4 + len(VISUAL_KEYS) * SL_PITCH + 12
+                text("MEDIA EFFECTS", 28, sep + 8, 13, WHITE, True, al=DIM_AL)
+                pygame.draw.line(surf, (255, 255, 255, 40), (int(24 * s), int((sep + 30) * s)), (int(816 * s), int((sep + 30) * s)), max(1, int(s)))
+                self.media_effects(st, hover, press, s, surf, hits, text, box, button, draw_sliders, cfg, sep + MSEP_H)
+            else:
+                self.media_section(st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, draw_sliders, cfg, ct)
+            keep(n0, y0, y1)
+        surf.set_clip(None)
+        if lay["preview"]["a"] > 0.05:
+            gx, gy, gw, gh, gf = preview_geom(lay, st.get("vscroll", 0.0))
+            if gf > 0.01:                                                      # docked preview: frame + swallow clicks under it
+                surf.set_clip(R_(0, HDR_Y, PW, FTR_Y - HDR_Y, s))
+                box(gx - 4, gy - 4, gw + 8, gh + 8, (10, 10, 18, int(190 * gf)), 14)
+                surf.set_clip(None)
+                hits.append(((gx - 4, gy - 4, gw + 8, gh + 8), ("noop", "pvmini")))
+        if lay["max_scroll"] > 0:                                              # scroll bar
+            tr_y0, tr_h = HDR_Y + 8, FTR_Y - HDR_Y - 16
+            th = max(30, tr_h * (FTR_Y - HDR_Y) / max(1.0, lay["end"] - HDR_Y))
+            ty = tr_y0 + (tr_h - th) * (st.get("vscroll", 0.0) / lay["max_scroll"])
+            box(PW - 12, tr_y0, 4, tr_h, (255, 255, 255, 14), 2)
+            box(PW - 12, ty, 4, th, (255, 255, 255, 90), 2)
+
+    def style_section(self, st, hover, press, s, surf, hits, text, box, cfg, y0):
         prev = st.get("style_prev")
         hsp = st.get("hov", {})
         nm = len(MODES)
@@ -1618,7 +2029,7 @@ class Panel:
         ih = int(iw * 9 / 16)
         card_h = ih + 12 + 26
         for k, name in enumerate(MODES):
-            x, y = 24 + k * (cw + 8), 94
+            x, y = 24 + k * (cw + 8), y0
             key = ("style", k)
             pp = press.get(key, 0.0)
             sc = (1.0 - 0.07 * pp) * (1.0 + 0.05 * hsp.get(key, 0.0))
@@ -1641,8 +2052,6 @@ class Panel:
                 pygame.draw.rect(surf, (255, 255, 255, 235), R_(cx - w / 2, cy - h / 2, w, h, s),
                                  width=max(2, int(2 * s)), border_radius=max(2, int(14 * s)))
             hits.append(((x, y, cw, card_h), key))
-        text("MOTION & EFFECTS", 28, 94 + card_h + 12, 13, WHITE, True, al=DIM_AL)
-        draw_sliders(VISUAL_KEYS, 94 + card_h + 34, (3, 5))
 
     def thumb_surface(self, tid, thumb, s, w=240, h=135, rad=14):
         key = (tid, round(s, 3), w)
@@ -1660,24 +2069,169 @@ class Panel:
         cache[key] = img
         return img
 
-    def stack_tab(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, cfg):
+    def scenes_tab(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, ic_prev, ic_next):
+        sc = st["scn"]
+        box(24, 72, 792, 46, (255, 255, 255, G_CARD), 16)
+        if sc["none"]:
+            text("No videos or GIFs in the stack yet \u2013 drop some onto the window.", PW / 2, 72, 16, WHITE, anchor="c", vh=46, al=DIM_AL)
+            text("Every scene the app finds in a clip will be listed here, so you can hide or delete the ones you don't want.", PW / 2, 150, 14, WHITE, anchor="c", al=DIM_AL)
+            return
+        multi = sc["n_clips"] > 1
+        if multi:
+            icon_button(30, 79, 36, 32, ("scn_clip", -1), ic_prev)
+            icon_button(774, 79, 36, 32, ("scn_clip", 1), ic_next)
+        text(sc["name"], PW / 2, 76, 16, WHITE, True, "c", maxw=620)
+        bits = [f"{sc['total']} scene{'s' if sc['total'] != 1 else ''} listed"]
+        if sc["hidden"]:
+            bits.append(f"{sc['hidden']} hidden")
+        if sc["deleted"]:
+            bits.append(f"{sc['deleted']} deleted")
+        if multi:
+            bits.append(f"clip {sc['idx'] + 1} of {sc['n_clips']}")
+        if sc["scanning"]:
+            bits.append("still finding scenes\u2026")
+        text("  \u00b7  ".join(bits), PW / 2, 97, 12, WHITE, anchor="c", al=DIM_AL)
+
+        # ---- left: preview + trim
+        px, py, pw_, ph_ = SCN_PV
+        box(px - 4, py - 4, pw_ + 8, ph_ + 8, (0, 0, 0, 120), 16)
+        tr = sc.get("trim")
+        if tr is None or not sc["rows"]:
+            text("Click a scene to preview it", px + pw_ / 2, py, 15, WHITE, anchor="c", vh=ph_, al=DIM_AL)
+        else:
+            lo, hi, a, b = tr["lo"], tr["hi"], tr["a"], tr["b"]
+            ts, te = tr["s"], tr["e"]
+            xo = lambda v: TRK_X0 + (v - lo) / max(1e-6, hi - lo) * TRK_W
+            text(f"Scene {tr['no']}  \u00b7  looping {fmt_time(ts)} \u2013 {fmt_time(te)}", px, py + ph_ + 10, 14, WHITE, True)
+            text(f"{te - ts:.1f}s", px + pw_, py + ph_ + 10, 14, WHITE, False, "r", al=DIM_AL)
+            text("TRIM", px + 4, TRK_Y - 30, 12, WHITE, True, al=DIM_AL)
+            text("drag the handles to shorten or lengthen the scene", px + pw_, TRK_Y - 30, 12, WHITE, False, "r", al=110)
+            box(TRK_X0, TRK_Y - 3, TRK_W, 6, (255, 255, 255, 40), 3)
+            box(xo(ts), TRK_Y - 3, max(2, xo(te) - xo(ts)), 6, (255, 255, 255, 170), 3)
+            for v in (a, b):                                        # ticks: where the scene originally starts / ends
+                box(xo(v) - 1, TRK_Y + 9, 2, 8, (255, 255, 255, 110), 1)
+            hov_t = hover == ("trim",)
+            for v, kk in ((ts, "s"), (te, "e")):
+                grab = tr["grab"] == kk
+                r_ = 9.5 + (1.5 if (grab or hov_t) else 0)
+                pygame.draw.circle(surf, (0, 0, 0, 70), (int(xo(v) * s), int((TRK_Y + 1.5) * s)), int((r_ + 1.5) * s))
+                pygame.draw.circle(surf, (255, 255, 255, 250), (int(xo(v) * s), int(TRK_Y * s)), int(r_ * s))
+            if tr["pos"] is not None:
+                pxp = xo(max(lo, min(hi, tr["pos"])))
+                box(pxp - 1, TRK_Y - 12, 2, 24, (255, 90, 120, 230), 1)
+            text(fmt_time(lo), TRK_X0, TRK_Y + 20, 11, WHITE, al=100)
+            text(fmt_time(hi), TRK_X0 + TRK_W, TRK_Y + 20, 11, WHITE, False, "r", al=100)
+            hits.append(((TRK_X0 - 16, TRK_Y - 18, TRK_W + 32, 36), ("trim",)))
+            by_ = TRK_Y + 46
+            button(24, by_, 110, 34, "Reset trim", ("scn_trim_reset",), False, 13, r=10) if tr["has"] else \
+                box(24, by_, 110, 34, (255, 255, 255, 12), 10)
+            if not tr["has"]:
+                text("Reset trim", 24 + 55, by_, 13, WHITE, anchor="c", vh=34, al=70)
+            button(142, by_, 170, 34, "Play on screen", ("scn_play",), False, 13, r=10)
+
+        # ---- right: the scene list
+        box(LIST_X - 6, SCN_Y - 4, LIST_W + 6, SCN_ROWS * SCN_ROW_H + 8, (255, 255, 255, 13), 16)
+        if not sc["rows"]:
+            text("Nothing listed \u2013 every scene was deleted.", LIST_X + LIST_W / 2, SCN_Y + 150, 14, WHITE, anchor="c", al=DIM_AL)
+            text("Use \u201cRestore deleted\u201d below.", LIST_X + LIST_W / 2, SCN_Y + 172, 14, WHITE, anchor="c", al=DIM_AL)
+        for k, r in enumerate(sc["rows"]):
+            x = LIST_X
+            y = SCN_Y + k * SCN_ROW_H
+            w = LIST_W - 8
+            hid = r["f"] == 1
+            sel = sc.get("sel") is not None and abs(r["t"] - sc["sel"]) < 0.01
+            key = ("scn_go", sc["id"], round(r["t"], 2))
+            pp = max(0.0, press.get(key, 0.0))
+            if sel:
+                box(x - 2, y + 2, w + 2, SCN_ROW_H - 4, (255, 255, 255, 44), 12)
+                pygame.draw.rect(surf, (255, 255, 255, 200), R_(x - 2, y + 2, w + 2, SCN_ROW_H - 4, s), width=max(1, int(1.5 * s)), border_radius=max(2, int(12 * s)))
+            elif hover == key or pp > 0:
+                box(x + 3 * pp, y + 2 + 2 * pp, w - 6 * pp, SCN_ROW_H - 4 - 4 * pp, lerp_col((255, 255, 255, 24), (38, 38, 48, 125), pp), 12)
+            hits.append(((x, y, w - 108, SCN_ROW_H), key))
+            if r["th"] is not None:
+                surf.blit(self.thumb_surface((sc["tid"], round(r["t"], 2)), r["th"], s, 64, 36, 6), (int((x + 10) * s), int((y + 5) * s)))
+            else:
+                box(x + 10, y + 5, 64, 36, (255, 255, 255, 22), 6)
+            if hid:
+                box(x + 10, y + 5, 64, 36, (0, 0, 0, 150), 6)
+            text(f"Scene {r['no']}", x + 84, y + 3, 14, WHITE, not hid, al=120 if hid else 255)
+            sub = f"{fmt_time(r['t'])}  \u00b7  {r['ln']:.1f}s" + ("  \u00b7  trimmed" if r["tr"] else "") + ("  \u00b7  hidden" if hid else "")
+            text(sub, x + 84, y + 24, 12, WHITE, al=DIM_AL)
+            button(x + w - 98, y + 9, 60, 28, "Show" if hid else "Hide", ("scn_hide", sc["id"], round(r["t"], 2)), hid, 12, False, r=10)
+            icon_button(x + w - 34, y + 9, 28, 28, ("scn_del", sc["id"], round(r["t"], 2)), ic_x)
+        n_rows = sc["total"]
+        if n_rows > SCN_ROWS:
+            th = SCN_ROWS * SCN_ROW_H
+            bh = max(24, th * SCN_ROWS / n_rows)
+            by = SCN_Y + (th - bh) * (st["scn_scroll"] / max(1, n_rows - SCN_ROWS))
+            box(810, by, 4, bh, (255, 255, 255, 120), 2)
+        yb = SCN_Y + SCN_ROWS * SCN_ROW_H + 18
+        button(24, yb, 150, 38, "Hide all", ("scn_all", "hide_all"), False, 14)
+        button(182, yb, 190, 38, f"Show hidden ({sc['hidden']})", ("scn_all", "show_all"), False, 14)
+        button(380, yb, 210, 38, f"Restore deleted ({sc['deleted']})", ("scn_all", "restore"), False, 14)
+        text("Click a scene to preview it.  Hidden scenes stay listed but never play; deleted ones leave the list (restore any time).", 28, yb + 50, 13, WHITE, al=DIM_AL)
+        if sc["few"]:
+            text("Few cuts were found in this clip, so evenly spaced moments are used as well until you hide or delete a scene.", 28, yb + 72, 13, WHITE, al=DIM_AL)
+
+    def media_section(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, draw_sliders, cfg, top):
+        o = top - 72                                              # the layout below was drawn for a tab starting at y = 72
+        mi = st["media"]
+        box(24, 72 + o, 792, 168, (255, 255, 255, G_CARD), 18)
+        if mi.get("loaded"):
+            surf.blit(self.thumb_surface(mi["tid"], mi["thumb"], s), (int(40 * s), int((88 + o) * s)))
+        else:
+            box(40, 88 + o, 240, 135, (255, 255, 255, 18), 14)
+            text("No media", 160, 88 + o, 15, WHITE, True, "c", vh=135, al=DIM_AL)
+        if mi.get("loaded"):
+            kind = {"video": "Video", "gif": "GIF", "image": "Image"}.get(mi["kind"], mi["kind"].title())
+            text(mi["name"], 304, 84 + o, 20, WHITE, True, maxw=490)
+            bits = [kind, f"{mi['size'][0]}\u00d7{mi['size'][1]}"]
+            if mi["kind"] != "image" and mi["duration"] > 0:
+                bits.append(fmt_time(mi["duration"]))
+            text("  \u00b7  ".join(bits), 304, 114 + o, 14, WHITE, al=DIM_AL)
+            if mi["kind"] == "image":
+                note = "Still image \u2013 stays put, pulses with the bass"
+            elif mi["scan"] < 100:
+                note = f"Finding scenes\u2026 {mi['scan']}%"
+            else:
+                note = f"{mi['scenes']} scenes found" if mi["scenes"] else "No hard cuts found \u2013 using evenly spaced moments"
+            text(note, 304, 138 + o, 13, WHITE, al=DIM_AL)
+            if mi["count"] > 1 and not mi.get("error"):
+                text(f"{mi['count']} clips in the stack \u00b7 {mi['total_scenes']} scenes", 304, 158 + o, 13, WHITE, al=DIM_AL)
+        elif mi.get("loading"):
+            text("Loading\u2026", 304, 84 + o, 20, WHITE, True)
+        else:
+            text("Drop videos, GIFs or images", 304, 84 + o, 20, WHITE, True)
+            text("It blends into the visuals and changes scene on the beat", 304, 114 + o, 14, WHITE, al=DIM_AL)
+        if mi.get("error"):
+            text(mi["error"], 304, 158 + o, 13, (255, 150, 140), maxw=490)
+        button(304, 180 + o, 160, 38, "Add files\u2026", ("media_add",))
+        button(474, 180 + o, 120, 38, "Scenes\u2026", ("tab", "scenes"))
+        on = cfg["media_on"]
+        button(604, 180 + o, 192, 38, "Media layer: " + ("ON" if on else "OFF"), ("toggle", "media_on"), on, 14)
+
+        self.stack_list(st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, cfg, top + 180)
+
+    def stack_list(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, cfg, y0):
         mi = st["media"]
         items, sc = mi["items"], st["mscroll"]
         n = len(items)
         head = f"STACK  \u00b7  {n} clip{'s' if n != 1 else ''}"
         if n:
             head += f"  \u00b7  {mi['total_scenes']} scenes to pick from"
-        text(head, 28, 74, 13, WHITE, True, al=DIM_AL)
-        box(24, 92, 792, STACK_ROWS * STACK_ROW_H + 8, (255, 255, 255, 13), 16)
+        text(head, 28, y0, 13, WHITE, True, al=DIM_AL)
+        ly = y0 + 20
+        box(24, ly, 792, STACK_ROWS * STACK_ROW_H + 8, (255, 255, 255, 13), 16)
+        hits.append(((24, ly, 792, STACK_ROWS * STACK_ROW_H + 8), ("noop", "mlist")))          # lets the wheel scroll the list, not the page
         if n == 0:
-            text("Drop videos, GIFs or images onto the window \u2013 they stack up here.", PW / 2, 92 + 120, 16, WHITE, anchor="c", al=DIM_AL)
-            text("Scene changes will pick from every clip in the stack.", PW / 2, 92 + 148, 14, WHITE, anchor="c", al=DIM_AL)
+            text("Drop videos, GIFs or images onto the window \u2013 they stack up here.", PW / 2, ly + 100, 16, WHITE, anchor="c", al=DIM_AL)
+            text("Scene changes will pick from every clip in the stack.", PW / 2, ly + 128, 14, WHITE, anchor="c", al=DIM_AL)
         for r in range(STACK_ROWS):
             i = sc + r
             if i >= n:
                 break
             it = items[i]
-            y = 96 + r * STACK_ROW_H
+            y = ly + 4 + r * STACK_ROW_H
             is_cur = it["id"] == mi["cur_id"]
             key = ("mrow", it["id"])
             pp = max(0.0, press.get(key, 0.0))
@@ -1707,129 +2261,29 @@ class Panel:
         if n > STACK_ROWS:
             th = STACK_ROW_H * STACK_ROWS
             bh = max(24, th * STACK_ROWS / n)
-            by = 96 + (th - bh) * (sc / max(1, n - STACK_ROWS))
+            by = ly + 4 + (th - bh) * (sc / max(1, n - STACK_ROWS))
             box(810, by, 4, bh, (255, 255, 255, 120), 2)
-        yb = 92 + STACK_ROWS * STACK_ROW_H + 20
-        button(24, yb, 200, 38, "Add files\u2026", ("media_add",))
-        button(234, yb, 150, 38, "Clear all", ("media_clear",), danger=True)
-        button(394, yb, 150, 38, "Scenes\u2026", ("tab", "scenes"))
-        on = cfg["media_on"]
-        button(610, yb, 206, 38, "Media layer: " + ("ON" if on else "OFF"), ("toggle", "media_on"), on, 14)
-        text("Click a clip to jump to it.  Kick / snare cuts, beats, V and the timer all pick scenes from the whole stack.", 28, yb + 50, 13, WHITE, al=DIM_AL)
-        text("Drop more files any time to add them.  Video sound is ignored.", 28, yb + 72, 13, WHITE, al=DIM_AL)
+        yb = ly + STACK_ROWS * STACK_ROW_H + 20
+        button(24, yb, 150, 38, "Clear all", ("media_clear",), danger=True)
+        text("Click a clip to jump to it.  Kick / snare cuts, beats, V and the timer pick scenes from the whole stack.", 28, yb + 48, 13, WHITE, al=DIM_AL)
+        text("Drop more files any time to add them.  Video sound is ignored.", 28, yb + 68, 13, WHITE, al=DIM_AL)
 
-    def scenes_tab(self, st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, ic_prev, ic_next):
-        sc = st["scn"]
-        box(24, 72, 792, 46, (255, 255, 255, G_CARD), 16)
-        if sc["none"]:
-            text("No videos or GIFs in the stack yet \u2013 drop some onto the window.", PW / 2, 72, 16, WHITE, anchor="c", vh=46, al=DIM_AL)
-            text("Every scene the app finds in a clip will be listed here, so you can hide or delete the ones you don't want.", PW / 2, 150, 14, WHITE, anchor="c", al=DIM_AL)
-            return
-        multi = sc["n_clips"] > 1
-        if multi:
-            icon_button(30, 79, 36, 32, ("scn_clip", -1), ic_prev)
-            icon_button(774, 79, 36, 32, ("scn_clip", 1), ic_next)
-        text(sc["name"], PW / 2, 76, 16, WHITE, True, "c", maxw=620)
-        bits = [f"{sc['total']} scene{'s' if sc['total'] != 1 else ''} listed"]
-        if sc["hidden"]:
-            bits.append(f"{sc['hidden']} hidden")
-        if sc["deleted"]:
-            bits.append(f"{sc['deleted']} deleted")
-        if multi:
-            bits.append(f"clip {sc['idx'] + 1} of {sc['n_clips']}")
-        if sc["scanning"]:
-            bits.append("still finding scenes\u2026")
-        text("  \u00b7  ".join(bits), PW / 2, 97, 12, WHITE, anchor="c", al=DIM_AL)
-
-        box(24, SCN_Y - 4, 792, SCN_ROWS * SCN_ROW_H + 8, (255, 255, 255, 13), 16)
-        if not sc["rows"]:
-            text("Nothing listed \u2013 every scene was deleted. Use \u201cRestore deleted\u201d below.", PW / 2, SCN_Y + 140, 15, WHITE, anchor="c", al=DIM_AL)
-        for k, r in enumerate(sc["rows"]):
-            col, row = k % 2, k // 2
-            x = 30 + col * 396
-            y = SCN_Y + row * SCN_ROW_H
-            w = 384
-            hid = r["f"] == 1
-            key = ("scn_go", sc["id"], round(r["t"], 2))
-            pp = max(0.0, press.get(key, 0.0))
-            if hover == key or pp > 0:
-                box(x + 3 * pp, y + 2 + 2 * pp, w - 6 * pp, SCN_ROW_H - 4 - 4 * pp, lerp_col((255, 255, 255, 24), (38, 38, 48, 125), pp), 12)
-            hits.append(((x, y, w - 108, SCN_ROW_H), key))
-            if r["th"] is not None:
-                surf.blit(self.thumb_surface((sc["tid"], round(r["t"], 2)), r["th"], s, 64, 36, 6), (int((x + 10) * s), int((y + 5) * s)))
-            else:
-                box(x + 10, y + 5, 64, 36, (255, 255, 255, 22), 6)
-            if hid:
-                box(x + 10, y + 5, 64, 36, (0, 0, 0, 150), 6)
-            text(f"Scene {r['no']}", x + 84, y + 3, 14, WHITE, not hid, al=120 if hid else 255)
-            sub = f"{fmt_time(r['t'])}  \u00b7  {r['ln']:.1f}s" + ("  \u00b7  hidden" if hid else "")
-            text(sub, x + 84, y + 24, 12, WHITE, al=DIM_AL)
-            button(x + w - 98, y + 9, 60, 28, "Show" if hid else "Hide", ("scn_hide", sc["id"], round(r["t"], 2)), hid, 12, False, r=10)
-            icon_button(x + w - 34, y + 9, 28, 28, ("scn_del", sc["id"], round(r["t"], 2)), ic_x)
-        n_rows = (sc["total"] + 1) // 2
-        if n_rows > SCN_ROWS:
-            th = SCN_ROWS * SCN_ROW_H
-            bh = max(24, th * SCN_ROWS / n_rows)
-            by = SCN_Y + (th - bh) * (st["scn_scroll"] / max(1, n_rows - SCN_ROWS))
-            box(810, by, 4, bh, (255, 255, 255, 120), 2)
-        yb = SCN_Y + SCN_ROWS * SCN_ROW_H + 18
-        button(24, yb, 150, 38, "Hide all", ("scn_all", "hide_all"), False, 14)
-        button(182, yb, 190, 38, f"Show hidden ({sc['hidden']})", ("scn_all", "show_all"), False, 14)
-        button(380, yb, 210, 38, f"Restore deleted ({sc['deleted']})", ("scn_all", "restore"), False, 14)
-        text("Click a scene to jump to it.  Hidden scenes stay listed but never play; deleted ones leave the list (restore any time).", 28, yb + 50, 13, WHITE, al=DIM_AL)
-        if sc["few"]:
-            text("Few cuts were found in this clip, so evenly spaced moments are used as well until you hide or delete a scene.", 28, yb + 72, 13, WHITE, al=DIM_AL)
-
-    def media_tab(self, st, hover, press, s, surf, hits, text, box, button, draw_sliders, cfg):
-        mi = st["media"]
-        box(24, 72, 792, 168, (255, 255, 255, G_CARD), 18)
-        if mi.get("loaded"):
-            surf.blit(self.thumb_surface(mi["tid"], mi["thumb"], s), (int(40 * s), int(88 * s)))
-        else:
-            box(40, 88, 240, 135, (255, 255, 255, 18), 14)
-            text("No media", 160, 88, 15, WHITE, True, "c", vh=135, al=DIM_AL)
-        if mi.get("loaded"):
-            kind = {"video": "Video", "gif": "GIF", "image": "Image"}.get(mi["kind"], mi["kind"].title())
-            text(mi["name"], 304, 84, 20, WHITE, True, maxw=490)
-            bits = [kind, f"{mi['size'][0]}\u00d7{mi['size'][1]}"]
-            if mi["kind"] != "image" and mi["duration"] > 0:
-                bits.append(fmt_time(mi["duration"]))
-            text("  \u00b7  ".join(bits), 304, 114, 14, WHITE, al=DIM_AL)
-            if mi["kind"] == "image":
-                note = "Still image \u2013 stays put, pulses with the bass"
-            elif mi["scan"] < 100:
-                note = f"Finding scenes\u2026 {mi['scan']}%"
-            else:
-                note = f"{mi['scenes']} scenes found" if mi["scenes"] else "No hard cuts found \u2013 using evenly spaced moments"
-            text(note, 304, 138, 13, WHITE, al=DIM_AL)
-            if mi["count"] > 1 and not mi.get("error"):
-                text(f"{mi['count']} clips in the stack \u00b7 {mi['total_scenes']} scenes", 304, 158, 13, WHITE, al=DIM_AL)
-        elif mi.get("loading"):
-            text("Loading\u2026", 304, 84, 20, WHITE, True)
-        else:
-            text("Drop videos, GIFs or images", 304, 84, 20, WHITE, True)
-            text("It blends into the visuals and changes scene on the beat", 304, 114, 14, WHITE, al=DIM_AL)
-        if mi.get("error"):
-            text(mi["error"], 304, 158, 13, (255, 150, 140), maxw=490)
-        button(304, 180, 160, 38, "Add files\u2026", ("media_add",))
-        button(474, 180, 120, 38, "Stack\u2026", ("tab", "stack"))
-        on = cfg["media_on"]
-        button(604, 180, 192, 38, "Media layer: " + ("ON" if on else "OFF"), ("toggle", "media_on"), on, 14)
-
+    def media_effects(self, st, hover, press, s, surf, hits, text, box, button, draw_sliders, cfg, top):
+        o = top - 248                                              # the layout below was drawn with the blend row at y = 248
         for k, name in enumerate(BLENDS):
-            button(24 + k * 158, 248, 150, 36, name, ("mblend", k), cfg["media_blend"] == k, 14)
+            button(24 + k * 158, 248 + o, 150, 36, name, ("mblend", k), cfg["media_blend"] == k, 14)
         ao = cfg["media_auto"]
-        button(660, 248, 156, 36, "Beat: " + ("ON" if ao else "OFF"), ("toggle", "media_auto"), ao, 14)
-        draw_sliders(MEDIA_KEYS, 296, ())
+        button(660, 248 + o, 156, 36, "Beat: " + ("ON" if ao else "OFF"), ("toggle", "media_auto"), ao, 14)
+        draw_sliders(MEDIA_KEYS, 296 + o, ())
         hit = cfg["media_hit"]
-        button(24, 536, 142, 34, "Cut on hit: " + ("ON" if hit else "OFF"), ("toggle", "media_hit"), hit, 13)
+        button(24, 536 + o, 142, 34, "Cut on hit: " + ("ON" if hit else "OFF"), ("toggle", "media_hit"), hit, 13)
         sw = cfg["media_sway"]
-        button(172, 536, 112, 34, "Sway: " + ("ON" if sw else "OFF"), ("toggle", "media_sway"), sw, 13)
+        button(172, 536 + o, 112, 34, "Sway: " + ("ON" if sw else "OFF"), ("toggle", "media_sway"), sw, 13)
         sm_ = cfg["media_smooth"]
-        button(290, 536, 154, 34, "Smooth video: " + ("ON" if sm_ else "OFF"), ("toggle", "media_smooth"), sm_, 13)
+        button(290, 536 + o, 154, 34, "Smooth video: " + ("ON" if sm_ else "OFF"), ("toggle", "media_smooth"), sm_, 13)
         for k, name in enumerate(("Fade", "Blur", "Instant", "Zoom", "Random")):
-            button(452 + k * 73, 536, 69, 34, name, ("mstyle", k), cfg["media_style"] == k, 13)
-        text("Smooth video: motion interpolation adds in-between frames.  Sway = handheld camera on hits.  V = next scene.", 28, 576, 13, WHITE, al=DIM_AL)
+            button(452 + k * 73, 536 + o, 69, 34, name, ("mstyle", k), cfg["media_style"] == k, 13)
+        text("Smooth video: motion interpolation adds in-between frames.  Sway = handheld camera on hits.  V = next scene.", 28, 576 + o, 13, WHITE, al=DIM_AL)
 
     def render(self, st, W, H, hover, tab, scroll):
         s = self.scale(W, H)
@@ -1910,6 +2364,108 @@ class Panel:
         def P(pts):
             return [(int(px * s), int(py * s)) for px, py in pts]
 
+        def aa(name, cx, cy, col, size=24.0):
+            """Anti-aliased icon: drawn 4x on a transparent tile, shrunk smoothly, cached."""
+            px = max(8, int(round(size * s)))
+            key_ = (name, px, tuple(col))
+            img = self.icon_cache.get(key_)
+            if img is None:
+                B = px * 4
+                u = B / 24.0
+                big = pygame.Surface((B, B), pygame.SRCALPHA)
+                c = tuple(col)
+                lw = max(2, int(2.1 * u))
+
+                def poly(pts):
+                    pygame.draw.polygon(big, c, [(x * u, y * u) for x, y in pts])
+
+                def pl(pts, w=lw):
+                    q = [(x * u, y * u) for x, y in pts]
+                    pygame.draw.lines(big, c, False, q, w)
+                    for p_ in q:
+                        pygame.draw.circle(big, c, (int(p_[0]), int(p_[1])), w // 2)
+
+                if name == "play":
+                    poly([(8.0, 5.0), (8.0, 19.0), (19.5, 12.0)])
+                elif name == "pause":
+                    for x_ in (6.5, 13.5):
+                        pygame.draw.rect(big, c, (x_ * u, 5 * u, 4 * u, 14 * u), border_radius=int(1.2 * u))
+                elif name == "next":
+                    poly([(5.5, 6.0), (5.5, 18.0), (16.0, 12.0)])
+                    pygame.draw.rect(big, c, (16.8 * u, 6 * u, 2.6 * u, 12 * u), border_radius=int(0.8 * u))
+                elif name == "prev":
+                    poly([(18.5, 6.0), (18.5, 18.0), (8.0, 12.0)])
+                    pygame.draw.rect(big, c, (4.6 * u, 6 * u, 2.6 * u, 12 * u), border_radius=int(0.8 * u))
+                elif name == "shuffle":
+                    pl([(3.5, 7.0), (7.5, 7.0), (14.0, 17.0), (17.0, 17.0)])
+                    pl([(3.5, 17.0), (7.5, 17.0), (10.0, 13.2)])
+                    pl([(12.0, 10.8), (14.0, 7.0), (17.0, 7.0)])
+                    poly([(16.5, 3.8), (21.0, 7.0), (16.5, 10.2)])
+                    poly([(16.5, 13.8), (21.0, 17.0), (16.5, 20.2)])
+                elif name == "repeat":
+                    pl([(7.0, 8.0), (5.0, 8.0), (3.5, 9.5), (3.5, 14.5), (5.0, 16.0), (13.0, 16.0)])
+                    pl([(17.0, 16.0), (19.0, 16.0), (20.5, 14.5), (20.5, 9.5), (19.0, 8.0), (11.0, 8.0)])
+                    poly([(10.5, 4.6), (15.0, 8.0), (10.5, 11.4)])
+                    poly([(13.5, 12.6), (9.0, 16.0), (13.5, 19.4)])
+                elif name == "speaker":
+                    poly([(3.0, 9.5), (7.0, 9.5), (12.0, 5.0), (12.0, 19.0), (7.0, 14.5), (3.0, 14.5)])
+                    for r_ in (4.5, 8.0):
+                        rect = pygame.Rect((12.5 - r_ * 0.35) * u, (12 - r_) * u, r_ * 2 * u * 0.9, r_ * 2 * u)
+                        pygame.draw.arc(big, c, rect, -0.85, 0.85, max(2, int(1.7 * u)))
+                elif name == "mute":
+                    poly([(3.0, 9.5), (7.0, 9.5), (12.0, 5.0), (12.0, 19.0), (7.0, 14.5), (3.0, 14.5)])
+                    pl([(15.0, 9.0), (21.0, 15.0)])
+                    pl([(21.0, 9.0), (15.0, 15.0)])
+                img = pygame.transform.smoothscale(big, (px, px))
+                if len(self.icon_cache) > 400:
+                    self.icon_cache.clear()
+                self.icon_cache[key_] = img
+            surf.blit(img, (int(cx * s - px / 2), int(cy * s - px / 2)))
+
+        def disc(cx, cy, d, col):
+            """Anti-aliased filled circle."""
+            px = max(6, int(round(d * s)))
+            key_ = ("disc", px, tuple(col))
+            img = self.icon_cache.get(key_)
+            if img is None:
+                big = pygame.Surface((px * 4, px * 4), pygame.SRCALPHA)
+                pygame.draw.circle(big, tuple(col), (px * 2, px * 2), px * 2)
+                img = pygame.transform.smoothscale(big, (px, px))
+                self.icon_cache[key_] = img
+            surf.blit(img, (int(cx * s - px / 2), int(cy * s - px / 2)))
+
+        def ring(cx, cy, d, col, w=1.4):
+            """Anti-aliased circle outline."""
+            px = max(6, int(round(d * s)))
+            wp = max(1, int(round(w * s * 4)))
+            key_ = ("ring", px, wp, tuple(col))
+            img = self.icon_cache.get(key_)
+            if img is None:
+                big = pygame.Surface((px * 4, px * 4), pygame.SRCALPHA)
+                pygame.draw.circle(big, tuple(col), (px * 2, px * 2), px * 2, wp)
+                img = pygame.transform.smoothscale(big, (px, px))
+                self.icon_cache[key_] = img
+            surf.blit(img, (int(cx * s - px / 2), int(cy * s - px / 2)))
+
+        def round_btn(cx, cy, d, key, icon, filled=False, on=False, dim=False, isz=24.0):
+            """Round transport button: white disc when filled (play/pause), soft glass disc on hover / when on."""
+            hov = hover == key
+            pp = press.get(key, 0.0)
+            cp = max(0.0, pp)
+            sc = (1.0 - 0.10 * pp) * (1.0 + 0.07 * hsp.get(key, 0.0))
+            dd = d * sc
+            if filled:
+                disc(cx, cy, dd, (255, 255, 255, 96 if hov else 62))             # frosted glass disc with a bright rim
+                ring(cx, cy, dd, (255, 255, 255, 170 if hov else 120), 1.5)
+                aa(icon, cx + (0.6 if icon == "play" else 0.0), cy, WHITE, isz)
+            else:
+                if on:
+                    disc(cx, cy, dd, (255, 255, 255, 62))
+                elif hov and not dim:
+                    disc(cx, cy, dd, (255, 255, 255, 40))
+                aa(icon, cx, cy, (255, 255, 255, 80 if dim else 255), isz * sc)
+            hits.append(((cx - d / 2, cy - d / 2, d, d), key))
+
         def ic_play(cx, cy, col):
             pygame.draw.polygon(surf, col, P([(cx - 6, cy - 9), (cx - 6, cy + 9), (cx + 9, cy)]))
 
@@ -1924,6 +2480,26 @@ class Panel:
         def ic_prev(cx, cy, col):
             pygame.draw.polygon(surf, col, P([(cx + 8, cy - 8), (cx + 8, cy + 8), (cx - 4, cy)]))
             pygame.draw.rect(surf, col, R(cx - 8, cy - 8, 3, 16))
+
+        def ic_shuffle(cx, cy, col):
+            w = max(2, int(2 * s))
+            pygame.draw.lines(surf, col, False, P([(cx - 9, cy - 6), (cx - 4, cy - 6), (cx + 4, cy + 6), (cx + 6, cy + 6)]), w)
+            pygame.draw.lines(surf, col, False, P([(cx - 9, cy + 6), (cx - 4, cy + 6), (cx + 4, cy - 6), (cx + 6, cy - 6)]), w)
+            pygame.draw.polygon(surf, col, P([(cx + 5, cy - 10), (cx + 5, cy - 2), (cx + 11, cy - 6)]))
+            pygame.draw.polygon(surf, col, P([(cx + 5, cy + 2), (cx + 5, cy + 10), (cx + 11, cy + 6)]))
+
+        def ic_repeat(cx, cy, col):
+            w = max(2, int(2 * s))
+            pygame.draw.lines(surf, col, False, P([(cx - 5, cy - 6), (cx - 9, cy - 6), (cx - 10, cy - 2), (cx - 10, cy + 2), (cx - 9, cy + 6), (cx + 1, cy + 6)]), w)
+            pygame.draw.lines(surf, col, False, P([(cx + 5, cy + 6), (cx + 9, cy + 6), (cx + 10, cy + 2), (cx + 10, cy - 2), (cx + 9, cy - 6), (cx - 1, cy - 6)]), w)
+            pygame.draw.polygon(surf, col, P([(cx - 3, cy - 11), (cx - 3, cy - 1), (cx + 3, cy - 6)]))
+            pygame.draw.polygon(surf, col, P([(cx + 3, cy + 1), (cx + 3, cy + 11), (cx - 3, cy + 6)]))
+
+        def ic_speaker(cx, cy, col):
+            pygame.draw.polygon(surf, col, P([(cx - 8, cy - 3), (cx - 4, cy - 3), (cx + 1, cy - 8), (cx + 1, cy + 8), (cx - 4, cy + 3), (cx - 8, cy + 3)]))
+            w = max(2, int(1.6 * s))
+            pygame.draw.arc(surf, col, R(cx - 2, cy - 6, 12, 12), -0.9, 0.9, w)
+            pygame.draw.arc(surf, col, R(cx - 2, cy - 10, 20, 20), -0.9, 0.9, w)
 
         def ic_up(cx, cy, col):
             pygame.draw.polygon(surf, col, P([(cx - 6, cy + 3), (cx + 6, cy + 3), (cx, cy - 5)]))
@@ -1968,9 +2544,9 @@ class Panel:
 
         # ---- header
         text("Hypnosis", 30, 12, 26, WHITE, True, vh=40)
-        for k, (nm, tk) in enumerate((("Queue", "queue"), ("Visuals", "visuals"), ("Media", "media"), ("Stack", "stack"),
+        for k, (nm, tk) in enumerate((("Queue", "queue"), ("Visuals", "visuals"),
                                       ("Scenes", "scenes"), ("Beat", "beat"), ("Settings", "settings"))):
-            button(150 + k * 74, 13, 70, 36, nm, ("tab", tk), tab == tk, 13, True, r=18)
+            button(150 + k * 92, 13, 88, 36, nm, ("tab", tk), tab == tk, 13, True, r=18)
         button(676, 13, 94, 36, "Exit", ("exit",), False, 14, True, r=18, danger=True)
         icon_button(778, 13, 40, 36, ("close",), ic_x)
         line(62)
@@ -1979,35 +2555,8 @@ class Panel:
 
         if tab == "queue":
             names, cur = st["names"], st["cur"]
-            box(24, 72, 792, 128, (255, 255, 255, G_CARD), 18)
-            if st["spotify"]:
-                t = st["spot_title"]
-                shown = t if (t and not t.lower().startswith("spotify")) else (
-                    "Spotify is paused" if st["spot_running"] else "Spotify isn't running")
-                text(shown, 44, 82, 21, WHITE, True, maxw=752)
-                text("SPOTIFY MODE  ·  hearing Spotify only", 44, 116, 13, (30, 215, 96), True)
-            else:
-                title = names[cur] if 0 <= cur < len(names) else "Nothing playing"
-                if st["loading"]:
-                    title += "   (loading…)"
-                text(title, 44, 82, 21, WHITE, True, maxw=752)
-                pos, total = st["pos"], st["total"]
-                box(SEEK_X0, 122, SEEK_W, 8, (255, 255, 255, 55), 4)
-                frac = 0.0 if total <= 0 else max(0.0, min(1.0, pos / total))
-                if frac > 0:
-                    box(SEEK_X0, 122, SEEK_W * frac, 8, (255, 255, 255, 240), 4)
-                    kx, ky = int((SEEK_X0 + SEEK_W * frac) * s), int(126 * s)
-                    pygame.draw.circle(surf, (0, 0, 0, 70), (kx, ky + int(1.5 * s)), max(4, int(8 * s)))
-                    pygame.draw.circle(surf, WHITE, (kx, ky), max(3, int(7 * s)))
-                hits.append(((SEEK_X0, 112, SEEK_W, 28), ("seek",)))
-                text(fmt_time(pos), SEEK_X0, 138, 13, WHITE, al=DIM_AL)
-                text(fmt_time(total), SEEK_X0 + SEEK_W, 138, 13, WHITE, anchor="r", al=DIM_AL)
-            icon_button(340, 158, 52, 34, ("prev",), ic_prev)
-            icon_button(400, 158, 60, 34, ("playpause",), ic_pause if st["playing"] else ic_play, True)
-            icon_button(468, 158, 52, 34, ("next",), ic_next)
-
             n = len(names)
-            text(f"QUEUE  ·  {n} track{'s' if n != 1 else ''}", 28, 208, 13, WHITE, True, al=DIM_AL)
+            text(f"QUEUE  ·  {n} track{'s' if n != 1 else ''}", 28, 72, 13, WHITE, True, al=DIM_AL)
             box(24, LIST_Y - 2, 792, ROW_H * LIST_ROWS + 4, (255, 255, 255, 13), 16)
             if n == 0:
                 text("Queue is empty — drop files onto the window or use “Add files”.", PW / 2, LIST_Y + 110, 16, WHITE, anchor="c", al=DIM_AL)
@@ -2035,7 +2584,7 @@ class Panel:
                 by = LIST_Y + (th - bh) * (scroll / max(1, n - LIST_ROWS))
                 box(810, by, 4, bh, (255, 255, 255, 120), 2)
 
-            by = 526
+            by = 528
             button(24, by, 180, 36, "Add files…", ("add_files",))
             button(214, by, 150, 36, "Shuffle upcoming", ("shuffle",), sz=14)
             button(374, by, 150, 36, "Clear upcoming", ("clear_up",), sz=14)
@@ -2043,56 +2592,69 @@ class Panel:
             button(674, by, 142, 36, "Loop queue", ("toggle", "loop"), cfg["loop"], 14)
 
         elif tab == "visuals":
-            self.visuals_tab(st, hover, press, s, surf, hits, text, box, draw_sliders, cfg)
+            self.visuals_tab(st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, draw_sliders, cfg)
 
         elif tab == "settings":
-            text("DISPLAY", 28, 74, 13, WHITE, True, al=DIM_AL)
+            text("MODES", 28, 68, 13, WHITE, True, al=DIM_AL)
+            dom, spot = cfg["domination"], st["spotify"]
+            button(24, 84, 280, 32, "DOMINATION MODE  ·  " + ("ON" if dom else "OFF"), ("toggle", "domination"),
+                   dom, 14, True, C_DOM, C_DOM_H, r=14)
+            button(316, 84, 280, 32, "SPOTIFY MODE  ·  " + ("ON" if spot else "OFF"), ("spotify",),
+                   spot, 14, True, C_SPOT, C_SPOT_H, r=14, tcol_override=DARK)
+            if st["spot_error"]:
+                waiting = st["spot_error"].startswith("Waiting")
+                text(st["spot_error"], 608, 84, 13, WHITE if waiting else (255, 150, 140), maxw=208, vh=32, al=DIM_AL if waiting else 255)
+            else:
+                text("Keys:  D  and  S", 608, 84, 13, WHITE, vh=32, al=DIM_AL)
+
+            o = 46
+            text("DISPLAY", 28, 74 + o, 13, WHITE, True, al=DIM_AL)
             kinds = [("windowed", "Windowed"), ("borderless", "Borderless fullscreen"), ("exclusive", "Exclusive fullscreen")]
             cur_kind = st["fs_kind"] if st["is_fs"] else "windowed"
             for k, (kind, label) in enumerate(kinds):
-                button(24 + k * 268, 94, 256, 38, label, ("display", kind), cur_kind == kind, 15)
+                button(24 + k * 268, 94 + o, 256, 38, label, ("display", kind), cur_kind == kind, 15)
 
-            text("INTERFACE", 28, 142, 13, WHITE, True, al=DIM_AL)
-            button(24, 162, 240, 34, "Show help hints: " + ("On" if cfg["help"] else "Off"), ("toggle", "help"), cfg["help"], 14)
-            button(272, 162, 290, 34, "Remember media on startup: " + ("On" if cfg["media_remember"] else "Off"), ("toggle", "media_remember"), cfg["media_remember"], 14)
-            box(570, 162, 246, 34, (255, 255, 255, G_CARD), 12)
-            text("Domination phrases: add phrases.txt", 693, 162, 13, WHITE, anchor="c", maxw=232, vh=34, al=DIM_AL)
+            text("INTERFACE", 28, 142 + o, 13, WHITE, True, al=DIM_AL)
+            button(24, 162 + o, 240, 34, "Show help hints: " + ("On" if cfg["help"] else "Off"), ("toggle", "help"), cfg["help"], 14)
+            button(272, 162 + o, 290, 34, "Remember media on startup: " + ("On" if cfg["media_remember"] else "Off"), ("toggle", "media_remember"), cfg["media_remember"], 14)
+            box(570, 162 + o, 246, 34, (255, 255, 255, G_CARD), 12)
+            text("Domination phrases: add phrases.txt", 693, 162 + o, 13, WHITE, anchor="c", maxw=232, vh=34, al=DIM_AL)
 
-            text("AUDIO", 28, 206, 13, WHITE, True, al=DIM_AL)
-            draw_sliders(SETTINGS_KEYS, 228, (0,))
+            text("AUDIO", 28, 206 + o, 13, WHITE, True, al=DIM_AL)
+            draw_sliders(SETTINGS_KEYS, 228 + o, (0,))
 
-            text("SHORTCUTS", 28, 300, 13, WHITE, True, al=DIM_AL)
-            box(24, 320, 792, 112, (255, 255, 255, 13), 16)
+            text("SHORTCUTS", 28, 267 + o, 13, WHITE, True, al=DIM_AL)
+            box(24, 287 + o, 792, 104, (255, 255, 255, 13), 16)
             keys = [("Space", "Play / pause"), ("Esc", "Open / close menu"), ("F / F11", "Fullscreen"),
                     ("M / Tab", "Next visual style"), ("D", "Domination mode"), ("S", "Spotify mode"),
                     ("V", "Next scene"), ("N / P", "Next / previous track"), ("Left/Right", "Seek 5 seconds"),
                     ("Up/Down", "Volume"), ("H", "Help hints"), ("Q", "Quit")]
             for i, (kk, dd) in enumerate(keys):
                 col, row = divmod(i, 4)
-                x, y = 38 + col * 262, 328 + row * 26
+                x, y = 38 + col * 262, 295 + o + row * 24
                 box(x, y + 2, 78, 22, (255, 255, 255, 40), 8)
                 text(kk, x + 39, y + 2, 12, WHITE, True, "c", vh=22)
                 text(dd, x + 88, y + 2, 13, WHITE, vh=22, al=DIM_AL + 20, maxw=160)
 
-            text("PRESETS", 28, 442, 13, WHITE, True, al=DIM_AL)
+            text("PRESETS", 28, 401 + o, 13, WHITE, True, al=DIM_AL)
             plist, psel = st["presets"], st["preset_sel"]
             pop = st["preset_open"]
-            button(24, 462, 300, 38, ("\u25BE  " + psel) if psel else "No presets saved yet", ("preset_dd",), pop, 14)
-            button(332, 462, 140, 38, "Save as new", ("preset_save",), False, 14)
-            button(480, 462, 110, 38, "Update", ("preset_update",), False, 14)
-            button(598, 462, 150, 38, "Click to confirm" if st["preset_del"] else "Delete", ("preset_delete",), False, 14, danger=True)
-            text("Saves every slider, toggle and style (not your clips or queue) to presets.json.", 28, 506, 13, WHITE, al=DIM_AL)
+            button(24, 421 + o, 300, 38, ("\u25BE  " + psel) if psel else "No presets saved yet", ("preset_dd",), pop, 14)
+            button(332, 421 + o, 140, 38, "Save as new", ("preset_save",), False, 14)
+            button(480, 421 + o, 110, 38, "Update", ("preset_update",), False, 14)
+            button(598, 421 + o, 150, 38, "Click to confirm" if st["preset_del"] else "Delete", ("preset_delete",), False, 14, danger=True)
+            text("Saves every slider, toggle and style (not your clips or queue) to presets.json.", 28, 465 + o, 13, WHITE, al=DIM_AL)
 
             armed = st["reset_armed"]
-            button(24, 540, 240, 38, "Click again to confirm" if armed else "Reset all settings", ("reset_all",),
+            button(24, 499 + o, 240, 34, "Click again to confirm" if armed else "Reset all settings", ("reset_all",),
                    False, 14, danger=True)
-            text("Restores every slider and toggle to its default. Your clips and queue stay.", 280, 540, 13, WHITE, vh=38, al=DIM_AL)
+            text("Restores every slider and toggle to its default. Your clips and queue stay.", 280, 499 + o, 13, WHITE, vh=34, al=DIM_AL)
 
             if pop and plist:                                   # dropdown list: newest first, drawn last so it sits on top
                 shown = list(reversed(plist))[:7]
                 rh = 32
                 bh = len(shown) * rh + 12
-                by = 462 - bh - 6
+                by = 421 + o - bh - 6
                 hits.append(((24, by, 300, bh + 6), ("noop",)))
                 box(24, by, 300, bh, (32, 34, 52, 245), 14)
                 for i, nm in enumerate(shown):
@@ -2104,28 +2666,113 @@ class Panel:
                     text(nm + ("   \u2713" if nm == psel else ""), 44, ry, 14, WHITE, vh=rh - 2)
                     hits.append(((30, ry, 288, rh - 2), key))
 
-        elif tab == "media":
-            self.media_tab(st, hover, press, s, surf, hits, text, box, button, draw_sliders, cfg)
-        elif tab == "stack":
-            self.stack_tab(st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, cfg)
         elif tab == "scenes":
             self.scenes_tab(st, hover, press, s, surf, hits, text, box, button, icon_button, ic_x, ic_prev, ic_next)
         else:
             self.beat_tab(st, s, surf, text, box, draw_sliders, cfg)
 
-        # ---- footer
-        line(596)
-        dom, spot = cfg["domination"], st["spotify"]
-        button(24, 606, 280, 46, "DOMINATION MODE  ·  " + ("ON" if dom else "OFF"), ("toggle", "domination"),
-               dom, 15, True, C_DOM, C_DOM_H, r=16)
-        button(316, 606, 280, 46, "SPOTIFY MODE  ·  " + ("ON" if spot else "OFF"), ("spotify",),
-               spot, 15, True, C_SPOT, C_SPOT_H, r=16, tcol_override=DARK)
-        if st["spot_error"]:
-            waiting = st["spot_error"].startswith("Waiting")
-            text(st["spot_error"], PW - 30, 606, 13, WHITE if waiting else (255, 150, 140), anchor="r", maxw=215, vh=46,
-                 al=DIM_AL if waiting else 255)
+        # ---- now-playing bar (a Spotify-style player in the same glass): art + song | shuffle prev play next repeat + seek | volume
+        line(FTR_Y)
+        spot = st["spotify"]
+        names, cur = st["names"], st["cur"]
+        by0 = FTR_Y + 8
+        x0 = 24
+        if spot:
+            art = st.get("art")
+            ak = (st["art_ver"], int(ART * s))
+            if self.art_surf is None or self.art_surf[0] != ak:
+                if art is not None:
+                    sz = int(ART * s)
+                    im = art.resize((sz, sz))
+                    sf_ = pygame.image.frombuffer(im.tobytes(), im.size, "RGB").convert_alpha()
+                    m_ = pygame.Surface((sz, sz), pygame.SRCALPHA)
+                    pygame.draw.rect(m_, (255, 255, 255, 255), m_.get_rect(), border_radius=max(2, int(8 * s)))
+                    sf_.blit(m_, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+                    self.art_surf = (ak, sf_)
+                else:
+                    self.art_surf = (ak, None)
+            if self.art_surf[1] is not None:
+                surf.blit(self.art_surf[1], (int(x0 * s), int(by0 * s)))
+            else:
+                box(x0, by0, ART, ART, (30, 215, 96, 46), 8)
+                text("\u266A", x0 + ART / 2, by0, 28, (30, 215, 96), True, "c", vh=ART)
+            t = st["spot_title"]
+            if (not t or t.lower().startswith("spotify")) and st["spot_running"] and st["spot_track"]:
+                t = st["spot_track"]                                   # paused: keep showing the last song instead of "paused"
+            if st["spot_error"]:
+                wt = st["spot_error"].startswith("Waiting")
+                song, sub, subcol = ("Spotify is paused" if st["spot_running"] else "Spotify isn't running"), st["spot_error"], ((200, 200, 210) if wt else (255, 150, 140))
+            elif t and not t.lower().startswith("spotify"):
+                a_, _, so = t.partition(" - ")
+                song, sub, subcol = (so, a_, (30, 215, 96)) if so else (t, "SPOTIFY MODE", (30, 215, 96))
+            else:
+                song, sub, subcol = ("Spotify is paused" if st["spot_running"] else "Spotify isn't running"), "SPOTIFY MODE  \u00b7  hearing Spotify only", (30, 215, 96)
         else:
-            text("Esc  close", PW - 30, 606, 14, WHITE, anchor="r", vh=46, al=DIM_AL)
+            box(x0, by0, ART, ART, (255, 255, 255, 26), 8)
+            text("\u266A", x0 + ART / 2, by0, 28, WHITE, True, "c", vh=ART, al=150)
+            song = names[cur] if 0 <= cur < len(names) else "Nothing playing"
+            if st["loading"]:
+                song += "   (loading\u2026)"
+            sub, subcol = (f"Queue  \u00b7  track {cur + 1} of {len(names)}" if 0 <= cur < len(names) else "Drop files onto the window"), WHITE
+        text(song, x0 + ART + 12, by0 + 8, 17, WHITE, True, maxw=196)
+        text(sub, x0 + ART + 12, by0 + 32, 13, subcol, False, maxw=196, al=235 if subcol != WHITE else DIM_AL)
+
+        cy_ = by0 + 19
+        mid = PW / 2
+        round_btn(mid - 108, cy_, 34, ("noop", "sh") if spot else ("shuffle",), "shuffle", dim=spot, isz=26)
+        round_btn(mid - 60, cy_, 34, ("prev",), "prev", isz=26)
+        round_btn(mid, cy_, 38, ("playpause",), "pause" if st["playing"] else "play", filled=True, isz=24)
+        round_btn(mid + 60, cy_, 34, ("next",), "next", isz=26)
+        round_btn(mid + 108, cy_, 34, ("noop", "rp") if spot else ("toggle", "loop"), "repeat", on=(not spot and cfg["loop"]), dim=spot, isz=26)
+        sy_ = by0 + 50
+        if spot:
+            pos, total = (st["sp_pos"] or 0.0), (st["sp_dur"] or 0.0)
+        else:
+            pos, total = st["pos"], st["total"]
+        can_seek = total > 0
+        box(SEEK_X0, sy_, SEEK_W, 5, (255, 255, 255, 55 if can_seek else 40), 3)
+        if can_seek:
+            frac = max(0.0, min(1.0, pos / total))
+            if frac > 0:
+                box(SEEK_X0, sy_, SEEK_W * frac, 5, (255, 255, 255, 240), 3)
+            disc(SEEK_X0 + SEEK_W * frac, sy_ + 2.5, 11, WHITE) if (frac > 0 or spot) else None
+            hits.append(((SEEK_X0 - 4, sy_ - 9, SEEK_W + 8, 24), ("seek",)))
+            text(fmt_time(pos), SEEK_X0 - 10, sy_ - 8, 12, WHITE, anchor="r", vh=21, al=DIM_AL + 40)
+            text(fmt_time(total), SEEK_X0 + SEEK_W + 10, sy_ - 8, 12, WHITE, vh=21, al=DIM_AL + 40)
+        elif spot:
+            text("-:--", SEEK_X0 - 10, sy_ - 8, 12, WHITE, anchor="r", vh=21, al=90)
+            text("-:--", SEEK_X0 + SEEK_W + 10, sy_ - 8, 12, WHITE, vh=21, al=90)
+        else:
+            text(fmt_time(pos), SEEK_X0 - 10, sy_ - 8, 12, WHITE, anchor="r", vh=21, al=DIM_AL + 40)
+            text(fmt_time(total), SEEK_X0 + SEEK_W + 10, sy_ - 8, 12, WHITE, vh=21, al=DIM_AL + 40)
+
+        sv = st.get("spot_vol")
+        vol = (sv if sv is not None else 1.0) if spot else cfg["volume"]
+        vy = by0 + 30
+        aa("mute" if vol < 0.005 else "speaker", VOL_X0 - 20, vy, WHITE, 22)
+        hv_ = hover == ("vol",)
+        box(VOL_X0, vy - 2.5, VOL_W, 5, (255, 255, 255, 55), 3)
+        box(VOL_X0, vy - 2.5, max(2.0, VOL_W * vol), 5, (255, 255, 255, 240), 3)
+        disc(VOL_X0 + VOL_W * vol, vy, 15 if (hv_ or st.get("drag_vol")) else 11, WHITE)
+        text(f"{vol * 100:.0f}%", VOL_X0 + VOL_W + 10, vy - 10, 12, WHITE, vh=20, al=DIM_AL + 40)
+        hits.append(((VOL_X0 - 34, vy - 16, VOL_W + 32, 32), ("vol",)))
+
+        # Spotify mode switch: a glass disc, grey when off / green when on, with a colourful wave between the two
+        tr = st.get("sp_tr")
+        skey = ("spotify",)
+        sc_ = 1.0 + 0.09 * hsp.get(skey, 0.0) - 0.08 * max(0.0, press.get(skey, 0.0))
+        spx = max(16, int(round(40 * s * sc_)))
+        ik = (spx, tr[0] if tr else spot, int(tr[1] * 28) if tr else -1)
+        img = self.sp_icons.get(ik)
+        if img is None:
+            if len(self.sp_icons) > 160:
+                self.sp_icons.clear()
+            raw = spot_icon_pixels(spx, tr[0] if tr else spot, min(1.0, tr[1]) if tr else None)
+            img = pygame.image.frombuffer(raw, (spx, spx), "RGBA").convert_alpha()
+            self.sp_icons[ik] = img
+        scx, scy = 798, vy
+        surf.blit(img, (int(scx * s - spx / 2), int(scy * s - spx / 2)))
+        hits.append(((scx - 22, scy - 22, 44, 44), skey))
 
         self.hits = hits
         return surf, s
@@ -2724,6 +3371,7 @@ class MediaLayer:
         self.prep_since = 0.0
         self.cur_start = self.nxt_start = 0.0
         self.recent = []                 # (item id, scene time)
+        self.undo = []                   # (item id, scene time, previous flag) for the Z hotkey
         self._req = False
         self._focus = None
         self.error = None
@@ -2799,9 +3447,6 @@ class MediaLayer:
             self.state, self.fade = "static", 0.0
         self._refresh(now)
 
-    def clear_all(self):
-        self.clear()
-
     def clear(self):
         self._drop_heads()
         for it in self.items:
@@ -2838,7 +3483,7 @@ class MediaLayer:
             t = self._pick_start(it)
             self.cur_it, self.cur_start = it, t
             self.cur = it["src"].make_head()
-            self.cur.play_from(t)
+            self.cur.play_from(self.eff_start(it, t))
             if hasattr(self.cur, "set_rate"):
                 self.cur.set_rate(self.speed)
             self.tex_serial = [-1, -1]
@@ -2913,9 +3558,58 @@ class MediaLayer:
                and (d <= 0 or t < d - 0.5)]
         return it, random.choice(far or pool)
 
+    # ---- scene trims (a scene's own start / end, set in the Scenes tab)
+    def trim_of(self, it, t):
+        """(start, end) the user set for the scene that begins at t, or None."""
+        for t0, a, b in ((self._pf(it) or {}).get("trim") or []):
+            if abs(t0 - t) <= SCENE_TOL:
+                return a, b
+        return None
+
+    def natural_range(self, it, t):
+        src = it["src"]
+        sc = sorted(src.scenes)
+        nxt = [x for x in sc if x > t + SCENE_TOL]
+        end = nxt[0] if nxt else (src.duration if src.duration > t + 0.5 else t + 5.0)
+        return t, end
+
+    def scene_range(self, it, t):
+        return self.trim_of(it, t) or self.natural_range(it, t)
+
+    def trim_domain(self, it, t):
+        """How far the trim handles may travel: a few seconds either side of the original scene."""
+        a, b = self.natural_range(it, t)
+        d = it["src"].duration
+        return max(0.0, a - 5.0), (min(d, b + 5.0) if d > 0 else b + 5.0)
+
+    def eff_start(self, it, t):
+        tr = self.trim_of(it, t)
+        return tr[0] if tr else t
+
+    def set_trim(self, iid, t, a, b, now):
+        it = next((x for x in self.items if x["id"] == iid and x["src"] is not None), None)
+        if it is None:
+            return
+        p = self.prefs.setdefault(it["path"], {"off": [], "del": [], "trim": []})
+        p["trim"] = [x for x in p.get("trim", []) if abs(x[0] - t) > SCENE_TOL]
+        na, nb = self.natural_range(it, t)
+        if abs(a - na) > 0.04 or abs(b - nb) > 0.04:
+            p["trim"].append([t, round(a, 3), round(b, 3)])
+        self._changed(it, now)
+
+    def _head_pos(self, h):
+        try:
+            if hasattr(h, "pos_frames"):
+                return h.pos_frames() / max(1e-6, h.src.fps)
+            if hasattr(h, "_pos"):
+                return h._pos()
+        except Exception:
+            pass
+        return 0.0
+
     # ---- scene manager (hide / delete / restore)
-    def scene_rows(self, it, shown):
-        """Rows for the Scenes tab: (start, length, flag) of every scene that isn't deleted. shown = 'all' or flags wanted."""
+    def scene_rows(self, it):
+        """Rows for the Scenes tab: (start, length, flag, number) of every scene that isn't deleted."""
         src, out = it["src"], []
         sc = sorted(src.scenes)
         for i, t in enumerate(sc):
@@ -2923,11 +3617,11 @@ class MediaLayer:
             if f == 2:
                 continue
             end = sc[i + 1] if i + 1 < len(sc) else (src.duration if src.duration > t else t)
-            out.append((t, max(0.0, end - t), f, i + 1))
+            tr = self.trim_of(it, t)
+            out.append((t, max(0.0, (tr[1] - tr[0]) if tr else (end - t)), f, i + 1))
         return out
 
     def counts(self, it):
-        p = self._pf(it) or {"off": [], "del": []}
         sc = it["src"].scenes
         return (sum(1 for t in sc if self.flag(it, t) == 1), sum(1 for t in sc if self.flag(it, t) == 2))
 
@@ -2936,22 +3630,70 @@ class MediaLayer:
         it = next((x for x in self.items if x["id"] == iid and x["src"] is not None), None)
         if it is None:
             return
-        p = self.prefs.setdefault(it["path"], {"off": [], "del": []})
+        p = self.prefs.setdefault(it["path"], {"off": [], "del": [], "trim": []})
         cur = self.flag(it, t)
         for lst in (p["off"], p["del"]):
             lst[:] = [x for x in lst if abs(x - t) > SCENE_TOL]
         if mode == "delete":
             p["del"].append(t)
-        elif mode == "hide" and cur == 0:
+        elif (mode == "hide" and cur == 0) or mode == "hide_force":
             p["off"].append(t)
         self._changed(it, now)
+
+    def playing_scene(self):
+        """(item, scene start) of the scene on screen right now, or None (images / clips with no scene list)."""
+        use_n = self.state == "fading" and self.fade > 0.5 and self.nxt is not None and self.nxt_it is not None
+        h, it = (self.nxt, self.nxt_it) if use_n else (self.cur, self.cur_it)
+        start = self.nxt_start if use_n else self.cur_start
+        if h is None or it is None or it.get("src") is None or it["src"].kind == "image" or not it["src"].scenes:
+            return None
+        pos = start
+        if hasattr(h, "pos_frames") and it["src"].fps:
+            try:
+                pos = h.pos_frames() / it["src"].fps
+            except Exception:
+                pos = start
+        sc = sorted(it["src"].scenes)
+        if _has(sc, start):
+            a, b = self.natural_range(it, start)
+            tr = self.trim_of(it, start)
+            if min(a, tr[0] if tr else a) - 0.3 <= pos < max(b, tr[1] if tr else b) + 0.15:
+                return it, start
+        before = [t for t in sc if t <= pos + 0.15]
+        return it, (before[-1] if before else sc[0])
+
+    def quick_flag(self, mode, now):
+        """Hotkey: hide / delete the scene on screen and cut away. Returns a message for the toast."""
+        ps = self.playing_scene()
+        if ps is None:
+            return "No scene to remove here"
+        it, t = ps
+        sc = sorted(it["src"].scenes)
+        num = next((i + 1 for i, x in enumerate(sc) if abs(x - t) < 1e-6), 0)
+        prev = self.flag(it, t)
+        self.undo.append((it["id"], t, prev))
+        del self.undo[:-30]
+        self.set_flag(it["id"], t, mode, now)
+        self.request_change()
+        name = os.path.basename(it["path"])
+        return f"Scene {num} of {name[:28]} {'deleted' if mode == 'delete' else 'hidden'}   (Z to undo)"
+
+    def undo_flag(self, now):
+        while self.undo:
+            iid, t, prev = self.undo.pop()
+            it = next((x for x in self.items if x["id"] == iid and x["src"] is not None), None)
+            if it is None:
+                continue
+            self.set_flag(iid, t, {0: "show", 1: "hide", 2: "delete"}[prev] if prev != 1 else "hide_force", now)
+            return "Scene restored" if prev == 0 else "Undone"
+        return "Nothing to undo"
 
     def set_all(self, iid, mode, now):
         """mode: hide_all | show_all | restore"""
         it = next((x for x in self.items if x["id"] == iid and x["src"] is not None), None)
         if it is None:
             return
-        p = self.prefs.setdefault(it["path"], {"off": [], "del": []})
+        p = self.prefs.setdefault(it["path"], {"off": [], "del": [], "trim": []})
         sc = list(it["src"].scenes)
         if mode == "hide_all":
             p["off"] = [t for t in sc if not _has(p["del"], t)]
@@ -2963,7 +3705,8 @@ class MediaLayer:
 
     def _changed(self, it, now):
         self.pver += 1
-        if not (self.prefs.get(it["path"]) or {}).get("off") and not (self.prefs.get(it["path"]) or {}).get("del"):
+        pf = self.prefs.get(it["path"]) or {}
+        if not pf.get("off") and not pf.get("del") and not pf.get("trim"):
             self.prefs.pop(it["path"], None)
         save_scene_prefs(self.prefs)
         if self.state in ("armed", "prep") and self.nxt_it is it and self.flag(it, self.nxt_start) != 0:
@@ -2976,7 +3719,7 @@ class MediaLayer:
         it, t = self._pick_next()
         self.nxt_it, self.nxt_start = it, t
         self.nxt = it["src"].make_head()
-        self.nxt.play_from(t, paused=True)
+        self.nxt.play_from(self.eff_start(it, t), paused=True)
         if hasattr(self.nxt, "set_rate"):
             self.nxt.set_rate(self.speed)
         self.tex_serial[1] = -1
@@ -3091,7 +3834,9 @@ class MediaLayer:
                 self._prepare(now)
         elif self.state == "armed":
             hold = 3.0 / max(0.3, rate)
-            if not halt and (self._req or now - self.last_change > max(9.0, 3.5 * hold)):
+            tr = self.trim_of(self.cur_it, self.cur_start) if self.cur_it is not None else None
+            end_hit = tr is not None and self._head_pos(self.cur) >= tr[1]          # a trimmed scene is over: cut away
+            if not halt and (self._req or end_hit or now - self.last_change > max(9.0, 3.5 * hold)):
                 self._go(now)                                 # request / no beats for a while
         elif self.state == "fading":
             self.fade += dt / self.fade_s
@@ -3151,18 +3896,18 @@ class MediaLayer:
         it = next((x for x in its if x["id"] == iid), None) or (its[0] if its else None)
         if it is None:
             return dict(none=True, n_clips=0, sig=("none",))
-        rows = self.scene_rows(it, "all")
-        top = scroll * 2
+        rows = self.scene_rows(it)
+        top = scroll
         out = []
         for t, ln, f, no in rows[top:top + per]:
-            out.append(dict(t=t, ln=ln, f=f, no=no, th=it["src"].scene_thumb(t)))
+            out.append(dict(t=t, ln=ln, f=f, no=no, th=it["src"].scene_thumb(t), tr=self.trim_of(it, t) is not None))
         hid, dele = self.counts(it)
         idx = its.index(it)
         s = it["src"]
         return dict(none=False, id=it["id"], name=os.path.basename(it["path"]), rows=out, total=len(rows), hidden=hid, deleted=dele,
                     idx=idx, n_clips=len(its), tid=id(s), few=(len(s.scenes) < 5 and not self._pf(it)),
                     scanning=getattr(s, "scan", 1.0) < 1.0,
-                    sig=(it["id"], self.pver, getattr(s, "sthumb_n", 0), scroll, len(s.scenes), len(rows)))
+                    sig=(it["id"], self.pver, getattr(s, "sthumb_n", 0), scroll, len(s.scenes), len(rows)), it=it)
 
     def info(self):
         oks = self._ok()
@@ -3235,6 +3980,11 @@ class App:
         self.dim = 0.55
         self.dom_prev, self.dom_last = 0.0, 0.0
         self.toast, self.toast_t = "", -10.0
+        self.vscroll, self.vscroll_d = 0.0, 0.0
+        self.tab_seen, self.tab_old, self.old_tex, self.tab_k = self.tab, self.tab, None, 1.0
+        self.card_mix, self.card_tex, self.demo = {}, {}, None          # per style card: hover mix 0..1, (texture, fbo); shared fake-beat clock
+        op = set(filter(None, self.cfg.get("vis_open", "").split(",")))
+        self.sec_a = {n: (1.0 if n in op else 0.0) for n, _ in VIS_SECTIONS}
         self.last_mouse = time.perf_counter()
         self.held = {}
         self.running = True
@@ -3253,9 +4003,15 @@ class App:
         self.cap = None
         self.cap_lock = threading.Lock()
         self.spot_wake = threading.Event()
+        self.spot_vol, self.spot_vol_pend, self.spot_vol_t, self.spot_vol_warned = None, None, 0.0, False
+        self.sp_play_ov = None
+        self.sp_tr = None                                  # (start time, turning on?) of the Spotify button wave
+        self.smtc = SmtcSpotify(lambda: self.spotify_on, lambda: self.toast_msg("Spotify seeking needs winrt: run setup_env.bat (or pip install winrt-runtime winrt-Windows.Media.Control)"))
         self.attach_failed_pid = None
         self.ana_spot = None
         self.spot_title, self.spot_running, self.spot_error, self.spot_last = "", False, "", ""
+        self.art_title, self.art_img, self.art_ver, self.art_cache = None, None, 0, None
+        self.spot_track = ""                               # last real "Artist - Song" seen (kept while paused)   # Spotify album art (fetched in the background)
         threading.Thread(target=self._poll_spotify, daemon=True).start()
         if self.cfg["spotify"]:
             self.set_spotify(True)
@@ -3270,10 +4026,16 @@ class App:
         self.overlay = Overlay(ctx, self.quads)
         self.glitch = GlitchText(ctx, quad, self.quads)
         self.panel = Panel()
+        self.pblur_prog = ctx.program(vertex_shader=RECT_VERT, fragment_shader=PBLUR_FRAG)
+        self.pblur_vao = ctx.vertex_array(self.pblur_prog, [(quad, "2f", "in_pos")])
+        self.prev_prog = ctx.program(vertex_shader=RECT_VERT, fragment_shader=PREV_FRAG)
+        self.prev_vao = ctx.vertex_array(self.prev_prog, [(quad, "2f", "in_pos")])
         self.media = MediaLayer(ctx)
         self.media_picked = []
         self.mscroll = 0
         self.scn_id, self.scn_scroll = None, 0
+        self.scn_sel, self.scn_sel_i, self.trim_drag = None, 0, None
+        self.pv = dict(head=None, key=None, tex=None, ser=None, pos=None, t0=0.0, s=0.0, e=0.0, scrub=-1.0)
         self.style_prev = None
         self.reset_t = -10.0
         self.panel_tex = None
@@ -3397,17 +4159,50 @@ class App:
     # ---------------------------------------------------------------- spotify mode
     def _poll_spotify(self):
         """Background: read Spotify's window title, and (re)attach the capture to Spotify's process."""
+        try:
+            import comtypes
+            comtypes.CoInitialize()                           # COM is per thread (Spotify volume)
+        except Exception:
+            pass
         while self.running:
             if self.spotify_on:
                 try:
                     self.spot_running, self.spot_title = find_spotify_window()
                 except Exception:
                     self.spot_running, self.spot_title = False, ""
+                t_ = self.spot_title
+                if t_ and not t_.lower().startswith("spotify"):
+                    self.spot_track = t_
+                if t_ != self.art_title and t_ and not t_.lower().startswith("spotify"):
+                    self.art_title = t_
+                    try:
+                        img = fetch_album_art(t_)
+                    except Exception as ex:
+                        log(f"album art lookup failed: {ex}")
+                        img = None
+                    if self.art_title == t_:
+                        self.art_img, self.art_ver = img, self.art_ver + 1
                 try:
                     pid = find_spotify_root_pid()
                 except Exception:
                     pid = None
                 self._sync_capture(pid)
+                try:
+                    if self.spot_vol_pend is not None:
+                        got = spotify_session_volume(self.spot_vol_pend)
+                        if got is not None:
+                            self.spot_vol_pend = None
+                    elif time.perf_counter() - self.spot_vol_t > 1.5 and not (self.drag and self.drag[0] == "vol"):
+                        cur = spotify_session_volume()
+                        if cur is not None:
+                            self.spot_vol = cur
+                except ImportError:
+                    self.spot_vol_pend = None
+                    if not self.spot_vol_warned:
+                        self.spot_vol_warned = True
+                        self.toast_msg("Spotify volume needs pycaw: run setup_env.bat (or pip install pycaw)")
+                except Exception as ex:
+                    log(f"spotify volume failed: {ex}")
             self.spot_wake.wait(1.0)
             self.spot_wake.clear()
 
@@ -3476,8 +4271,11 @@ class App:
             self.audio.stop()                      # local playback gives way to Spotify
             self.spot_last = ""
             self.spotify_on = True
+            self.sp_tr = (time.perf_counter(), True)
+            self.smtc.start()
             self.spot_wake.set()                   # attach right away
         else:
+            self.sp_tr = (time.perf_counter(), False)
             with self.cap_lock:
                 self.spotify_on = False
                 if self.cap:
@@ -3582,11 +4380,12 @@ class App:
         i = next((k for k, it in enumerate(its) if it["id"] == self.scn_id), 0)
         self.scn_id = its[(i + d) % len(its)]["id"]
         self.scn_scroll = 0
+        self.scn_sel = None
 
     def scn_clamp(self):
         it = next((x for x in self.scn_clips() if x["id"] == self.scn_id), None)
-        n = len(self.media.scene_rows(it, "all")) if it else 0
-        self.scn_scroll = max(0, min(max(0, (n + 1) // 2 - SCN_ROWS), self.scn_scroll))
+        n = len(self.media.scene_rows(it)) if it else 0
+        self.scn_scroll = max(0, min(max(0, n - SCN_ROWS), self.scn_scroll))
 
     def sync_media_cfg(self):
         self.cfg["media_paths"] = "|".join(self.media.paths())
@@ -3704,8 +4503,19 @@ class App:
         elif self.cur >= self.scroll + LIST_ROWS:
             self.scroll = self.cur - LIST_ROWS + 1
 
+    def spot_playing(self):
+        """Is Spotify playing? The click's own answer for a moment, then Windows' media session, else whether audio is flowing."""
+        ov = self.sp_play_ov
+        if ov is not None and time.perf_counter() < ov[1]:
+            return ov[0]
+        if self.smtc.dur is not None:
+            return bool(self.smtc.playing)
+        return bool(self.cap and self.cap.active)
+
     def play_pause(self):
         if self.spotify_on:
+            now_playing = self.spot_playing()
+            self.sp_play_ov = (not now_playing, time.perf_counter() + 1.5)       # flip the icon right away; the real state takes over after
             send_media_key(0xB3)
             return
         if self.audio.data is None:
@@ -3787,7 +4597,7 @@ class App:
             self.preset_open = False
             if kind == "preset_dd":
                 return
-        if kind not in ("slider", "seek", "noop"):
+        if kind not in ("slider", "seek", "noop", "trim", "vol"):
             self.press_start(key)
         if kind == "noop":
             pass
@@ -3828,6 +4638,9 @@ class App:
         elif kind == "seek":
             self.drag = key
             self.seek_to(lx)
+        elif kind == "vol":
+            self.drag = key
+            self.vol_to(lx)
         elif kind == "row_play":
             self.play_index(key[1])
         elif kind == "row_up":
@@ -3856,14 +4669,36 @@ class App:
         elif kind == "media_add":
             threading.Thread(target=pick_media_dialog, args=(self.media_picked,), daemon=True).start()
         elif kind == "media_clear":
-            self.media.clear_all()
+            self.media.clear()
             self.sync_media_cfg()
             self.mscroll = 0
             self.scn_id, self.scn_scroll = None, 0
+            self.scn_sel = None
         elif kind == "mrow":
             self.media.request_item(key[1])
+        elif kind == "sec":
+            op = [n for n, _ in VIS_SECTIONS if n in set(filter(None, self.cfg["vis_open"].split(",")))]
+            if key[1] in op:
+                op.remove(key[1])
+            else:
+                op.append(key[1])
+                self.reveal = key[1]                                   # scroll the freshly opened section into view as it grows
+            self.cfg["vis_open"] = ",".join(op)
+        elif kind == "trim":
+            self.trim_begin(lx)
         elif kind == "scn_go":
-            self.media.request_item(key[1], key[2])
+            it = next((x for x in self.scn_clips() if x["id"] == key[1]), None)
+            ex = next((r[0] for r in self.media.scene_rows(it) if abs(r[0] - key[2]) < 0.01), key[2]) if it else key[2]
+            self.scn_sel = (key[1], ex)
+        elif kind == "scn_trim_reset":
+            it = next((x for x in self.scn_clips() if x["id"] == self.scn_sel[0]), None) if self.scn_sel else None
+            if it is not None:
+                a, b = self.media.natural_range(it, self.scn_sel[1])
+                self.media.set_trim(self.scn_sel[0], self.scn_sel[1], a, b, time.perf_counter())
+        elif kind == "scn_play":
+            if self.scn_sel:
+                self.media.request_item(self.scn_sel[0], self.scn_sel[1])
+                self.toast_msg("Playing that scene on screen")
         elif kind == "scn_hide":
             self.media.set_flag(key[1], key[2], "hide", time.perf_counter())
         elif kind == "scn_del":
@@ -3925,7 +4760,7 @@ class App:
 
     def update_hover(self, dt):
         """Every button swells with a spring when the cursor is over it (and settles back with a little overshoot)."""
-        h = self.hover if (self.menu_open and self.hover and self.hover[0] not in ("slider", "seek", "row_play")) else None
+        h = self.hover if (self.menu_open and self.hover and self.hover[0] not in ("slider", "seek", "row_play", "vol")) else None
         if h is not None and h not in self.hov_sp:
             self.hov_sp[h] = {"v": 0.0, "w": 0.0}
         dead = []
@@ -3967,7 +4802,22 @@ class App:
         if key == "volume":
             self.audio.set_volume(v)
 
+    def set_player_volume(self, v):
+        """The bar's volume slider: Spotify's own volume in Spotify mode, the normal volume otherwise."""
+        v = max(0.0, min(1.0, v))
+        if self.spotify_on:
+            self.spot_vol, self.spot_vol_pend, self.spot_vol_t = v, v, time.perf_counter()
+            self.spot_wake.set()
+        else:
+            self.set_slider("volume", v)
+
+    def vol_to(self, lx):
+        self.set_player_volume((lx - VOL_X0) / VOL_W)
+
     def seek_to(self, lx):
+        if self.spotify_on:                                  # Spotify: through the Windows media session
+            self.smtc.seek(max(0.0, min(1.0, (lx - SEEK_X0) / SEEK_W)) * (self.smtc.dur or 0.0))
+            return
         a = self.audio
         if a.data is not None:
             t = max(0.0, min(1.0, (lx - SEEK_X0) / SEEK_W))
@@ -3983,12 +4833,129 @@ class App:
                 self.slider_value(self.drag[1], lx)
             elif self.drag[0] == "seek":
                 self.seek_to(lx)
+            elif self.drag[0] == "vol":
+                self.vol_to(lx)
+            elif self.drag[0] == "trim":
+                self.trim_move(lx)
         self.hover = self.panel.pick(lx, ly)
 
     def scn_state(self):
         self.scn_pick_default()
         self.scn_clamp()
-        return self.media.scene_state(self.scn_id, self.scn_scroll, SCN_ROWS * 2)
+        sc = self.media.scene_state(self.scn_id, self.scn_scroll, SCN_ROWS)
+        if sc.get("none"):
+            self.scn_sel = None
+            return sc
+        it = sc["it"]
+        rows = self.media.scene_rows(it)
+        ts = [r[0] for r in rows]
+        if not ts:
+            self.scn_sel = None
+        elif self.scn_sel is None or self.scn_sel[0] != it["id"]:
+            self.scn_sel_i = 0
+            self.scn_sel = (it["id"], ts[0])
+        else:
+            k = next((i for i, t in enumerate(ts) if abs(t - self.scn_sel[1]) < 0.01), None)
+            if k is None:                                              # the selected scene was deleted: land on its neighbour
+                k = max(0, min(self.scn_sel_i, len(ts) - 1))
+                self.scn_sel = (it["id"], ts[k])
+            self.scn_sel_i = k
+        sel, tr = (self.scn_sel[1] if self.scn_sel else None), None
+        if sel is not None:
+            a, b = self.media.natural_range(it, sel)
+            lo, hi = self.media.trim_domain(it, sel)
+            td = self.trim_drag
+            s_, e_ = (td["s"], td["e"]) if td else self.media.scene_range(it, sel)
+            tr = dict(lo=lo, hi=hi, a=a, b=b, s=s_, e=e_, no=next((r[3] for r in rows if abs(r[0] - sel) < 0.01), 0),
+                      has=self.media.trim_of(it, sel) is not None, grab=(td["which"] if td else None), pos=self.pv["pos"] if self.pv["head"] is not None else None)
+        sc.update(sel=sel, trim=tr)
+        sc["sig"] = sc["sig"] + (sel, (round(tr["s"], 2), round(tr["e"], 2), tr["has"], tr["grab"], round(tr["pos"] * 8) if tr["pos"] is not None else None) if tr else None)
+        return sc
+
+    def update_scene_preview(self, now):
+        """Scenes tab: loop the selected scene (start to finish) in the preview; scrub while a trim handle is dragged."""
+        pv = self.pv
+        it = None
+        if self.menu_open and self.tab == "scenes" and self.scn_sel is not None:
+            it = next((x for x in self.scn_clips() if x["id"] == self.scn_sel[0]), None)
+        if it is None:
+            if pv["head"] is not None:
+                pv["head"].stop()
+                pv["head"], pv["key"], pv["pos"] = None, None, None
+            return
+        iid, t = self.scn_sel
+        td = self.trim_drag
+        s_, e_ = (td["s"], td["e"]) if td else self.media.scene_range(it, t)
+        if td:
+            want = td["s"] if td["which"] == "s" else max(td["s"], td["e"] - 0.05)
+            if pv["head"] is None or pv["key"] is not None:
+                if pv["head"] is not None:
+                    pv["head"].stop()
+                pv["head"], pv["key"], pv["scrub"] = it["src"].make_head(), None, -1.0
+            if abs(want - pv["scrub"]) > 0.04:
+                pv["head"].play_from(want, paused=True)
+                pv["scrub"] = want
+            pv["pos"] = want
+        else:
+            key = (iid, round(t, 2), round(s_, 2), round(e_, 2))
+            if pv["key"] != key or pv["head"] is None:
+                if pv["head"] is not None:
+                    pv["head"].stop()
+                h = it["src"].make_head()
+                h.play_from(s_)
+                pv.update(head=h, key=key, t0=now, scrub=-1.0)
+            pos = s_ + (now - pv["t0"])
+            if pos >= e_:
+                pv["head"].play_from(s_)
+                pv["t0"], pos = now, s_
+            pv["pos"] = pos
+        fr = pv["head"].get()
+        if fr is not None and (id(pv["head"]), fr[0]) != pv["ser"]:
+            f = np.ascontiguousarray(fr[1])
+            hh, ww = f.shape[0], f.shape[1]
+            if pv["tex"] is None or pv["tex"].size != (ww, hh):
+                if pv["tex"] is not None:
+                    pv["tex"].release()
+                pv["tex"] = self.ctx.texture((ww, hh), 3, alignment=1)
+                pv["tex"].filter = (moderngl.LINEAR, moderngl.LINEAR)
+                pv["tex"].repeat_x = pv["tex"].repeat_y = False
+            pv["tex"].write(f, alignment=1)
+            pv["ser"] = (id(pv["head"]), fr[0])
+
+    def trim_begin(self, lx):
+        sel = self.scn_sel
+        it = next((x for x in self.scn_clips() if x["id"] == sel[0]), None) if sel else None
+        if it is None:
+            return
+        lo, hi = self.media.trim_domain(it, sel[1])
+        s_, e_ = self.media.scene_range(it, sel[1])
+        xs = TRK_X0 + (s_ - lo) / max(1e-6, hi - lo) * TRK_W
+        xe = TRK_X0 + (e_ - lo) / max(1e-6, hi - lo) * TRK_W
+        which = "s" if (abs(lx - xs) < abs(lx - xe) or (abs(abs(lx - xs) - abs(lx - xe)) < 1e-6 and lx < xs)) else "e"
+        self.trim_drag = dict(iid=sel[0], t=sel[1], lo=lo, hi=hi, s=s_, e=e_, which=which)
+        self.drag = ("trim",)
+        self.trim_move(lx)
+
+    def trim_move(self, lx):
+        td = self.trim_drag
+        it = next((x for x in self.scn_clips() if x["id"] == td["iid"]), None) if td else None
+        if it is None:
+            return
+        lo, hi = td["lo"], td["hi"]
+        v = lo + (lx - TRK_X0) / TRK_W * (hi - lo)
+        for nv in self.media.natural_range(it, td["t"]):                   # snap to where the scene originally starts / ends
+            if abs((nv - v) / max(1e-6, hi - lo) * TRK_W) < 5.0:
+                v = nv
+        v = max(lo, min(hi, v))
+        if td["which"] == "s":
+            td["s"] = max(lo, min(v, td["e"] - TRIM_MIN))
+        else:
+            td["e"] = min(hi, max(v, td["s"] + TRIM_MIN))
+
+    def trim_commit(self, now):
+        td, self.trim_drag = self.trim_drag, None
+        if td:
+            self.media.set_trim(td["iid"], td["t"], td["s"], td["e"], now)
 
     def state_for_panel(self):
         a = self.audio
@@ -3998,7 +4965,7 @@ class App:
             cfg=self.cfg,
             names=[os.path.splitext(os.path.basename(p))[0] for p in self.playlist],
             cur=self.cur,
-            playing=(bool(self.cap and self.cap.active) if self.spotify_on else a.playing),
+            playing=(self.spot_playing() if self.spotify_on else a.playing),
             loading=a.loading,
             pos=a.pos / SR,
             total=(len(a.data) / SR) if a.data is not None else 0.0,
@@ -4006,14 +4973,21 @@ class App:
             fs_kind=self.cfg["fs_kind"],
             spotify=self.spotify_on,
             spot_title=self.spot_title,
+            spot_track=self.spot_track,
+            sp_tr=((self.sp_tr[1], (time.perf_counter() - self.sp_tr[0]) / 0.95) if (self.sp_tr and time.perf_counter() - self.sp_tr[0] < 0.95) else None),
+            sp_pos=self.smtc.position(), sp_dur=self.smtc.dur,
+            art_ver=self.art_ver, art=self.art_img, spot_vol=(round(self.spot_vol, 3) if self.spot_vol is not None else None),
             spot_running=self.spot_running,
             spot_error=self.spot_error,
             press={k: round(ent["v"], 3) for k, ent in self.press.items()},
             hov={k: round(ent["v"], 3) for k, ent in self.hov_sp.items()},
             sliders={k: (round(v["x"], 4), round(v["sc"], 3)) for k, v in self.sl.items()},
             drag_slider=(self.drag[1] if (self.drag and self.drag[0] == "slider") else None),
+            drag_vol=bool(self.drag and self.drag[0] == "vol"),
             media=dict(self.media.info(), error=self.media.error),
             mscroll=self.mscroll,
+            vscroll=round(self.vscroll_d, 1), aspect=round(self.vis_layout()["ph"] / PREV_W, 3),
+            sec_a={k: round(v, 3) for k, v in self.sec_a.items()},
             scn=(self.scn_state() if self.tab == "scenes" else None), scn_scroll=self.scn_scroll,
             style_prev=self.style_prev,
             reset_armed=(time.perf_counter() - self.reset_t < 3.0),
@@ -4022,15 +4996,83 @@ class App:
             beat=dict(bars=getattr(self, "vis_bars", (0,) * 48), kf=round(getattr(self, "kf", 0.0), 1), sf=round(getattr(self, "sf", 0.0), 1)),
         )
 
+    def vis_layout(self):
+        W, H = pygame.display.get_window_size()
+        return visuals_layout(H / max(1, W), {k: round(v, 3) for k, v in self.sec_a.items()})
+
+    def draw_preview(self, W, H, e, tab=None, fade=1.0, blur=0.0, tex_override=None):
+        """Live picture drawn over the panel (clipped to the scrolling area): Visuals = the mirrored scene, Scenes = the looping clip."""
+        x0, y0, w, h = self.panel_rect
+        k = w / PW
+        tab = tab or self.tab
+        if tab == "visuals":
+            lay = self.vis_layout()
+            L = lay["preview"]
+            if L["a"] < 0.01:
+                return
+            lx, ly, lw, lh, gf = preview_geom(lay, self.vscroll_d)
+            tex, flip = (tex_override if tex_override is not None else self.final_t), 0
+            if gf > 0.0:
+                clip_top, clip_bot = HDR_Y, FTR_Y                              # docked: follows the scroll over the whole page
+                fade = fade * min(1.0, L["a"] * 2.0)
+            else:
+                clip_top = L["hy"] + SEC_HDR_H - self.vscroll_d                 # only the open part of the section shows
+                clip_bot = clip_top + L["vis"]
+        else:
+            tex, flip = self.pv["tex"], 1
+            clip_top, clip_bot = HDR_Y, FTR_Y
+            if tex is None:
+                return
+            bx, by, bw, bh = SCN_PV
+            sc_ = min(bw / tex.size[0], bh / tex.size[1])
+            lw, lh = tex.size[0] * sc_, tex.size[1] * sc_
+            lx, ly = bx + (bw - lw) / 2, by + (bh - lh) / 2
+        top, bot = y0 + max(HDR_Y, clip_top) * k, y0 + min(FTR_Y, clip_bot) * k
+        rx, ry, rw, rh = x0 + lx * k, y0 + ly * k, lw * k, lh * k
+        if bot <= top:
+            return
+        if ry + rh <= top or ry >= bot:
+            return
+        ctx = self.ctx
+        ctx.scissor = (int(x0), int(H - bot), int(w), int(max(1, bot - top)))
+        (cx, cy), (hx, hy) = ndc_rect(rx, ry, rw, rh, W, H)
+        pr = self.prev_prog
+        pr["uCenter"].value, pr["uHalf"].value = (cx, cy), (hx, hy)
+        pr["uSize"].value = (float(rw), float(rh))
+        pr["uRad"].value = 12.0 * k
+        pr["uAlpha"].value = float(min(1.0, e ** 1.2) * fade)
+        pr["uFlip"].value = flip
+        pr["uBlur"].value = float(blur * w / max(1.0, self.panel_base[0]))
+        tex.use(0)
+        pr["uTex"].value = 0
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self.prev_vao.render(moderngl.TRIANGLE_STRIP)
+        ctx.disable(moderngl.BLEND)
+        ctx.scissor = None
+
+    def scroll_visuals(self, dy):
+        self.vscroll = max(0.0, min(float(self.vis_layout()["max_scroll"]), self.vscroll + dy))
+
     def draw_menu(self, W, H, e):
         """Composite pass: blurred backdrop + frosted glass panel, then the panel content on top."""
+        for m_, v_ in self.card_mix.items():
+            if v_ > 0.01:
+                self.render_style_demo(m_)
         st = self.state_for_panel()
         sig = (self.tab, self.hover, self.scroll, tuple(self.playlist), self.cur, int(st["pos"]),
-               st["playing"], st["loading"], self.is_fs, W, H, tuple(sorted(self.cfg.items())), st["spot_title"], st["spot_error"], st["spotify"], tuple(st["press"].items()), tuple(st["hov"].items()), tuple(sorted(st["sliders"].items())), st["drag_slider"],
+               st["playing"], st["loading"], self.is_fs, W, H, tuple(sorted(self.cfg.items())), st["spot_title"], st["spot_error"], st["spotify"], st["art_ver"], st["spot_vol"], st["spot_track"], ((st["sp_tr"][0], int(st["sp_tr"][1] * 28)) if st["sp_tr"] else None), (int((st["sp_pos"] / st["sp_dur"]) * 432) if st["sp_dur"] else None), tuple(st["press"].items()), tuple(st["hov"].items()), tuple(sorted(st["sliders"].items())), st["drag_slider"],
                (tuple(n for n, _ in self.presets), self.preset_sel, self.preset_open, time.perf_counter() - self.preset_del_t < 3.0),
                (st["media"]["sig"], st["media"]["loading"], st["media"]["error"], self.mscroll, st["reset_armed"], st["style_prev"] is not None),
                (st["beat"]["bars"], st["beat"]["kf"], st["beat"]["sf"]) if self.tab == "beat" else None,
-               st["scn"]["sig"] if st["scn"] else None)
+               st["scn"]["sig"] if st["scn"] else None, (st["vscroll"], st["aspect"], tuple(st["sec_a"].values()), st["cfg"]["vis_open"]) if self.tab == "visuals" else None)
+        if self.tab != self.tab_seen:                      # tab switch: keep the old picture to blur-fade out of
+            if self.menu_p > 0.9 and self.panel_tex is not None and self.panel_sig is not None and self.panel_tex.size == (self.panel_base[0], self.panel_base[1]):
+                if self.old_tex is not None:
+                    self.old_tex.release()
+                self.old_tex, self.panel_tex = self.panel_tex, None
+                self.tab_old, self.tab_k = self.tab_seen, 0.0
+            self.tab_seen = self.tab
         if sig != self.panel_sig:
             surf, sc = self.panel.render(st, W, H, self.hover, self.tab, self.scroll)
             self.panel_tex = surface_to_texture(self.ctx, surf, self.panel_tex)
@@ -4058,7 +5100,190 @@ class App:
         cp["uRectH"].value = (w / 2, h / 2)
         cp["uRad"].value = 30.0 * self.panel_scale * za
         self.comp_vao.render(moderngl.TRIANGLE_STRIP)
-        self.quads.draw(self.panel_tex, self.panel_rect, (W, H), e ** 1.2)
+        k = self.tab_k
+        if k < 1.0 and self.old_tex is not None and self.old_tex.size == self.panel_tex.size:
+            self.draw_tab_fade(W, H, e, k)
+        else:
+            if self.old_tex is not None:
+                self.old_tex.release()
+                self.old_tex = None
+            ob = 0.0
+            if e < 0.999:                                   # opening / closing: the panel sharpens in from a blur and blurs away again
+                ob = 16.0 * self.panel_scale * (1.0 - e) ** 1.4
+                self.ctx.enable(moderngl.BLEND)
+                self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+                self.draw_blurred(self.panel_tex, e ** 1.2, ob)
+                self.ctx.disable(moderngl.BLEND)
+            else:
+                self.quads.draw(self.panel_tex, self.panel_rect, (W, H), e ** 1.2)
+            if self.tab in ("visuals", "scenes"):
+                self.draw_preview(W, H, e, blur=ob)
+            if self.tab == "visuals":
+                for m_, v_ in self.card_mix.items():
+                    if v_ > 0.01 and m_ in self.card_tex:
+                        self.draw_card_demo(W, H, e, m_, v_)
+
+    def style_demo_target(self):
+        """The style card under the mouse (Visuals tab, menu fully open), else None."""
+        h = self.hover
+        if self.menu_open and self.tab == "visuals" and self.menu_p > 0.9 and h and h[0] == "style" and self.tab_k >= 1.0:
+            return h[1]
+        return None
+
+    def update_style_demo(self, dt):
+        """Hover a style card and its picture plays that style on a looping fake 120 bpm beat (each card blur-fades in / out)."""
+        want = self.style_demo_target()
+        if want is not None and self.demo is None:
+            self.demo = dict(t=0.0, rot=0.0, flow=0.0, hue=0.0, psy=0.0, wave=0.0, zk=0.0, kenv=0.0, penv=0.0, spin=0.0, bass=0.12, beat=-1)
+        if want is not None:
+            self.card_mix.setdefault(want, 0.0)
+        for m_ in list(self.card_mix):
+            v_ = self.card_mix[m_] + ((1.0 if m_ == want else 0.0) - self.card_mix[m_]) * (1 - math.exp(-dt * 3.6))
+            if m_ != want and v_ < 0.01:
+                del self.card_mix[m_]
+            else:
+                self.card_mix[m_] = v_
+        if not self.card_mix:
+            self.demo = None
+            return
+        d, cfg = self.demo, self.cfg
+        if d is None:
+            return
+        d["t"] += dt
+        beat_i = int(d["t"] / 0.5)
+        ph = (d["t"] % 0.5) / 0.5
+        kick = math.exp(-ph * 7.0)
+        if beat_i != d["beat"]:
+            d["beat"] = beat_i
+            d["spin"] += 1.5
+        d["spin"] *= math.exp(-dt * 3.6)
+        bass = 0.12 + 0.75 * kick
+        d["bass"] += (bass - d["bass"]) * (1 - math.exp(-dt * 30.0))
+        mid, high, energy = 0.30 + 0.15 * math.sin(d["t"] * 1.7), 0.20 + 0.10 * math.sin(d["t"] * 2.9 + 1.0), 0.30 + 0.35 * kick
+        d["rot"] += cfg["spin"] * (0.22 + d["spin"] + 0.9 * mid) * dt
+        d["flow"] += dt * (0.16 + 0.9 * mid + 0.5 * high)
+        d["hue"] += dt * (0.015 + 0.10 * high) * cfg["color"]
+        pe = min(1.0, d["bass"] * 1.2 + 0.8 * kick)
+        d["penv"] += (pe - d["penv"]) * (1 - math.exp(-dt * (14.0 if pe > d["penv"] else 2.2)))
+        d["psy"] = (d["psy"] + dt * (1.0 + 4.5 * d["penv"] + 0.8 * mid)) % TIME_WRAP
+        d["wave"] = (d["wave"] + dt * (0.7 + 1.8 * energy) * (0.5 + 0.5 * min(cfg["color"], 2.0))) % TAU_F
+        d["kenv"] += (pe - d["kenv"]) * (1 - math.exp(-dt * (12.0 if pe > d["kenv"] else 2.0)))
+        d["zk"] = (d["zk"] + dt * cfg["kzoom"] * (0.36 + 1.5 * d["kenv"])) % FLOWK_PERIOD
+        d["mid"], d["high"], d["energy"] = mid, high, energy
+
+    def render_style_demo(self, m):
+        """Draw style m into its own small target (same shader as the real scene)."""
+        d, cfg, ctx = self.demo, self.cfg, self.ctx
+        if d is None or "mid" not in d:
+            return
+        w, h = 339, 189                                          # 3x the card picture
+        if m not in self.card_tex:
+            t_ = ctx.texture((w, h), 4)
+            t_.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            t_.repeat_x = t_.repeat_y = False
+            self.card_tex[m] = (t_, ctx.framebuffer(color_attachments=[t_]))
+        self.card_tex[m][1].use()
+        ctx.viewport = (0, 0, w, h)
+        vid = m == VIDEO_MODE
+        mdl = self.media
+        has = bool(mdl.items) and cfg["media_on"]
+        for name, val in (
+            ("uRes", (float(w), float(h))), ("uRot", d["rot"] % TAU_F), ("uFlow", d["flow"] % 2.0), ("uFlowK", d["zk"]),
+            ("uZoom", d["bass"] * 0.075 * cfg["zoom"]), ("uAb", 0.0025 + d["bass"] * 0.040 * cfg["ab"]), ("uBass", float(d["bass"])),
+            ("uMid", float(d["mid"])), ("uHigh", float(d["high"])), ("uEnergy", float(d["energy"])), ("uHue", d["hue"] % 4.0),
+            ("uPsyT", float(d["psy"])), ("uHueWave", (min(1.0, cfg["color"] / 3.0), float(d["wave"]))), ("uTime", d["t"] + 7.0),
+            ("uWarp", 0.02 + 0.13 * d["mid"] + 0.05 * d["high"]), ("uDim", (1.0 if has else 0.0) if vid else 1.0),
+            ("uMode", 0 if vid else m), ("uMOn", 0.0),
+        ):
+            if name in self.prog:
+                self.prog[name].value = val
+        if vid and has:
+            mdl.bind(self.prog, cfg["media_peak"], 0.0, 3, 1.0, (0.0, 0.0, 0.0, 0.0), solo=True)
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        self.screen_fbo.use()
+
+    def draw_card_demo(self, W, H, e, m, mix):
+        """Style card m's picture plays the live demo, blur-fading in / out (drawn over the panel, clipped to the open part of the section)."""
+        lay = self.vis_layout()
+        L = lay["style"]
+        if L["a"] < 0.01:
+            return
+        x0, y0, w, h = self.panel_rect
+        k = w / PW
+        nm = len(MODES)
+        cw = (792 - 8 * (nm - 1)) / nm
+        iw = int(cw - 12)
+        ih = int(iw * 9 / 16)
+        card_h = ih + 12 + 26
+        key = ("style", m)
+        pp = (self.press.get(key) or {}).get("v", 0.0)
+        hv = (self.hov_sp.get(key) or {}).get("v", 0.0)
+        sc = (1.0 - 0.07 * pp) * (1.0 + 0.05 * hv)
+        cx = 24 + m * (cw + 8) + cw / 2
+        cy = L["ct"] - self.vscroll_d + card_h / 2
+        lx, ly = cx - cw * sc / 2 + 6 * sc, cy - card_h * sc / 2 + 6 * sc
+        lw, lh = iw * sc, ih * sc
+        clip_top = max(HDR_Y, L["hy"] + SEC_HDR_H - self.vscroll_d)
+        clip_bot = min(FTR_Y, L["hy"] + SEC_HDR_H - self.vscroll_d + L["vis"])
+        top, bot = y0 + clip_top * k, y0 + clip_bot * k
+        if bot <= top:
+            return
+        ctx = self.ctx
+        ctx.scissor = (int(x0), int(H - bot), int(w), int(max(1, bot - top)))
+        (ncx, ncy), (hx, hy) = ndc_rect(x0 + lx * k, y0 + ly * k, lw * k, lh * k, W, H)
+        pr = self.prev_prog
+        pr["uCenter"].value, pr["uHalf"].value = (ncx, ncy), (hx, hy)
+        pr["uSize"].value = (float(lw * k), float(lh * k))
+        pr["uRad"].value = 10.0 * k * sc
+        me = mix * mix * (3.0 - 2.0 * mix)
+        pr["uAlpha"].value = float(min(1.0, e ** 1.2) * min(1.0, me * 1.4))
+        pr["uFlip"].value = 0
+        pr["uBlur"].value = float((1.0 - me) * 8.0 * k)             # arrives blurred and sharpens; leaves by blurring away again
+        self.card_tex[m][0].use(0)
+        pr["uTex"].value = 0
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self.prev_vao.render(moderngl.TRIANGLE_STRIP)
+        ctx.disable(moderngl.BLEND)
+        ctx.scissor = None
+
+    def draw_blurred(self, tex, alpha, radius):
+        """The panel picture, blurred by `radius` texture pixels, at `alpha` (needs the blend state set by the caller)."""
+        x, y, w, h = self.panel_rect
+        W, H = pygame.display.get_window_size()          # not screen_fbo.size: that one keeps the size from startup
+        (cx, cy), (hx, hy) = ndc_rect(x, y, w, h, W, H)
+        pr = self.pblur_prog
+        pr["uCenter"].value, pr["uHalf"].value = (cx, cy), (hx, hy)
+        pr["uPx"].value = (radius / tex.size[0], radius / tex.size[1])
+        pr["uAlpha"].value = float(max(0.0, min(1.0, alpha)))
+        tex.use(0)
+        pr["uTex"].value = 0
+        self.pblur_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def draw_tab_fade(self, W, H, e, k):
+        """Tab switch: the old page blurs and fades away while the new one sharpens in; header and footer stay put."""
+        ctx = self.ctx
+        x, y, w, h = self.panel_rect
+        kk = w / PW
+        yh, yf = y + HDR_Y * kk, y + FTR_Y * kk
+        ss = lambda a, b, v: max(0.0, min(1.0, (v - a) / (b - a))) ** 2 * (3 - 2 * max(0.0, min(1.0, (v - a) / (b - a))))
+        base = e ** 1.2
+        for (sy0, sy1) in ((y, yh), (yf, y + h)):                            # header + footer: the new picture right away
+            ctx.scissor = (int(x) - 1, int(H - sy1) - 1, int(w) + 3, int(sy1 - sy0) + 3)
+            self.quads.draw(self.panel_tex, self.panel_rect, (W, H), base)
+        ctx.scissor = (int(x) - 1, int(H - yf), int(w) + 3, int(yf - yh) + 1)
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        rmax = 11.0 * self.panel_scale
+        a_out, a_in = 1.0 - ss(0.05, 0.60, k), ss(0.25, 0.80, k)
+        self.draw_blurred(self.old_tex, a_out * base, rmax * ss(0.0, 0.75, k))
+        self.draw_blurred(self.panel_tex, a_in * base, rmax * (1.0 - ss(0.25, 1.0, k)))
+        ctx.disable(moderngl.BLEND)
+        ctx.scissor = None
+        if self.tab_old in ("visuals", "scenes") and a_out > 0.01:
+            self.draw_preview(W, H, e, self.tab_old, a_out, rmax * ss(0.0, 0.75, k))
+        if self.tab in ("visuals", "scenes") and a_in > 0.01:
+            self.draw_preview(W, H, e, self.tab, a_in, rmax * (1.0 - ss(0.25, 1.0, k)))
 
     # ---------------------------------------------------------------- input
     def handle_key(self, k, now):
@@ -4079,6 +5304,10 @@ class App:
             cfg["help"] = not cfg["help"]
         elif k == pygame.K_v:
             self.media.request_change()
+        elif k in (pygame.K_x, pygame.K_DELETE) and not self.menu_open:
+            self.toast_msg(self.media.quick_flag("delete" if k == pygame.K_DELETE else "hide", now))
+        elif k == pygame.K_z and not self.menu_open:
+            self.toast_msg(self.media.undo_flag(now))
         elif k == pygame.K_s:
             self.set_spotify(not self.spotify_on)
         elif k == pygame.K_n:
@@ -4111,14 +5340,19 @@ class App:
                     self.menu_motion(*e.pos)
             elif e.type == pygame.MOUSEWHEEL:
                 if self.menu_open:
-                    if self.tab == "queue":
+                    if self.hover == ("vol",):
+                        self.set_player_volume((self.spot_vol if (self.spotify_on and self.spot_vol is not None) else (1.0 if self.spotify_on else self.cfg["volume"])) + 0.05 * e.y)
+                    elif self.tab == "queue":
                         mx_scroll = max(0, len(self.playlist) - LIST_ROWS)
                         self.scroll = max(0, min(mx_scroll, self.scroll - e.y))
-                    elif self.tab == "stack":
+                    elif self.tab == "visuals" and self.hover and (self.hover == ("noop", "mlist") or self.hover[0] in ("mrow", "mrow_remove")) \
+                            and len(self.media.items) > STACK_ROWS:
                         self.mscroll = max(0, min(max(0, len(self.media.items) - STACK_ROWS), self.mscroll - e.y))
                     elif self.tab == "scenes":
-                        self.scn_scroll -= e.y
+                        self.scn_scroll -= e.y * 2
                         self.scn_clamp()
+                    elif self.tab == "visuals" and not (pygame.key.get_mods() & pygame.KMOD_CTRL and self.hover and self.hover[0] in ("slider", "sl_reset")):
+                        self.scroll_visuals(-e.y * 70.0)
                     elif self.tab in ("settings", "visuals", "media", "beat") and self.hover and self.hover[0] in ("slider", "sl_reset"):
                         key = self.hover[1]
                         lo, hi = next((a, b) for k, _, a, b in SLIDERS if k == key)
@@ -4361,6 +5595,29 @@ class App:
                 self.muf = getattr(self, "muf", want)
                 self.muf += (want - self.muf) * (1 - math.exp(-dt * 10.0))
             a.muffle = e * self.muf
+            rv = getattr(self, "reveal", None)
+            if rv is not None:
+                if rv not in set(filter(None, cfg.get("vis_open", "").split(","))) or self.sec_a.get(rv, 0.0) > 0.999 or self.tab != "visuals":
+                    self.reveal = None
+                else:
+                    L = self.vis_layout()[rv]
+                    want = min(L["hy"] - HDR_Y - 8, L["hy"] + SEC_HDR_H + L["vis"] - FTR_Y + 10)
+                    self.vscroll = max(self.vscroll, min(want, float(self.vis_layout()["max_scroll"])))
+            self.scroll_visuals(0.0)                           # keep the target valid after a window resize
+            op = set(filter(None, cfg.get("vis_open", "").split(",")))
+            for n_ in self.sec_a:                              # sections open / close with an eased height
+                tgt = 1.0 if n_ in op else 0.0
+                v_ = self.sec_a[n_] + (tgt - self.sec_a[n_]) * (1 - math.exp(-dt * 11.0))
+                self.sec_a[n_] = tgt if abs(tgt - v_) < 0.004 else v_
+            self.vscroll_d += (self.vscroll - self.vscroll_d) * (1 - math.exp(-dt * 14.0))
+            if abs(self.vscroll - self.vscroll_d) < 0.05:
+                self.vscroll_d = self.vscroll
+            if self.menu_open and self.tab == "visuals" and self.vscroll_d != getattr(self, "_vs_seen", None):
+                self._vs_seen = self.vscroll_d
+                self.hover = self.panel.pick(*self.to_logical(*pygame.mouse.get_pos()))   # the page moved under a still mouse
+            if self.tab_k < 1.0:
+                self.tab_k = min(1.0, self.tab_k + dt / 0.36)
+            self.update_style_demo(dt)
             menu_visible = p > 0.0
 
             # ---- render scene (offscreen only while the menu is visible) ----
@@ -4408,6 +5665,9 @@ class App:
             self.update_press(now, dt)
             self.update_hover(dt)
             self.update_sliders(dt)
+            if self.trim_drag and not (self.drag and self.drag[0] == "trim"):
+                self.trim_commit(now)
+            self.update_scene_preview(now)
 
             if menu_visible:
                 self.blur_scene(e)
@@ -4429,7 +5689,7 @@ class App:
                     lines, alpha = [("Add Media To Begin" if not mdl.items else "Media layer is off", 40)], 0.55 + 0.35 * math.sin(now * 1.6)
                 elif vid and mdl.items and now - self.toast_t >= 3.2:
                     pass                                                  # Video style: just the footage, no idle / paused captions
-                elif idle and not a.loading:
+                elif idle and not a.loading and now - self.toast_t >= 3.2:
                     lines = [("Drop a music file to begin", 40)]
                     if cfg["help"]:
                         lines.append(("Space  play / pause    Esc  menu    F  fullscreen    M  mode    D  domination    V  next scene", 20))
