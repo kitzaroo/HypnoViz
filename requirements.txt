@@ -1,0 +1,9 @@
+pygame>=2.5
+moderngl>=5.10
+numpy
+miniaudio
+sounddevice
+opencv-python
+Pillow
+proc-tap; sys_platform == "win32"
+av

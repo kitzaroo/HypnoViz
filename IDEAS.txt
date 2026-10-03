@@ -1,0 +1,16 @@
+FIRST BUILD QUESTIONS AND COMMANDS!
+
+We need to use virtual environments to lock down package versions and python versions
+
+Am I using Conda or Python in this current project?
+
+(depending on which I am using change all of my batch file scripts to first "create" if it does not exist and then activate it before running any python commands)
+
+the virtual environment must be in the root of this repository or code base and add it to .gitignore
+
+
+
+(add a historical project board/recent projects for when you start the app up such as start a project or open a recent project or a project file that loads everything such as the music, video/s and or settings)
+
+
+(Add a loading screen when video scenes are being found to prevent the user from accidentally clicking something during the process since it causes the system to stutter or freeze for a few seconds)
