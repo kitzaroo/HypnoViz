@@ -1249,6 +1249,20 @@ DEFAULT_PHRASES = [
     "Sink Deeper", "Focus", "Surrender", "Stay Still", "Don't Look Away", "Good Pet",
 ]
 
+WARN_VERSION = "1"                                           # bump to make everyone accept the warning again
+WARN_TITLE = "Photosensitivity & health warning"
+WARN_PARAS = [
+    "Hypnosis produces flashing lights, strobing, spirals and rapid, high-contrast motion. "
+    "These can trigger seizures in people with photosensitive epilepsy, including people who have never had a seizure before. "
+    "They can also cause dizziness, nausea, headaches or disorientation.",
+    "Do NOT use Hypnosis if you, or anyone who can see the screen, has epilepsy, a seizure disorder, or is sensitive to flashing light. "
+    "Do not use it while driving or operating machinery.",
+    "Stop immediately and get medical help if you feel unwell. Use it in a well-lit room, sit well back from the screen and take regular breaks.",
+    "Hypnosis is entertainment software, not a medical or therapeutic product. By accepting, you confirm that you have read this warning, "
+    "that you are not at risk, and that you use Hypnosis at your own risk.",
+]
+
+
 DEFAULTS = dict(
     volume=0.85, mode=0, fs_kind="borderless",
     fx_off="", spin=0.4, zoom=1.0, ab=1.0, color=3.0,
@@ -1259,7 +1273,7 @@ DEFAULTS = dict(
     beat_smooth=0.35, media_flash=0.0, media_smooth=True, media_sway=False, media_sway_amt=1.0, media_hit=True, media_style=2, hit_cool=1.0,
     kick_lo=30.0, kick_hi=150.0, kick_sens=1.0, snare_lo=170.0, snare_hi=420.0, snare_sens=1.0,
     vis_open="style,preview,motion",
-    exp_res=1, exp_fps=1, exp_q=1, exp_fmt=0, exp_from=0, exp_len=0, exp_aspect=0, exp_audio=True, exp_gpu=False, exp_dir="", bass_fx=0, bass_fx_amt=1.0, zoom_mode=0,
+    exp_res=1, exp_fps=1, exp_q=1, exp_fmt=0, exp_from=0, exp_len=0, exp_aspect=0, exp_audio=True, exp_gpu=False, exp_dir="", bass_fx=0, bass_fx_amt=1.0, zoom_mode=0, warn_ack="",
 )
 
 SLIDERS = [  # key, label, min, max   (grouped: dividers are drawn after rows 0, 5 and 7)
@@ -1517,7 +1531,7 @@ def _has(lst, t):
     return any(abs(x - t) <= SCENE_TOL for x in lst)
 
 
-PRESET_SKIP = {"exp_res", "exp_fps", "exp_q", "exp_fmt", "exp_from", "exp_len", "exp_aspect", "exp_audio", "exp_gpu", "exp_dir", "vis_open", "media_remember", "volume", "spotify", "media_path", "media_paths", "fs_kind", "spot_delay", "help"}
+PRESET_SKIP = {"exp_res", "exp_fps", "exp_q", "exp_fmt", "exp_from", "exp_len", "exp_aspect", "exp_audio", "exp_gpu", "exp_dir", "vis_open", "media_remember", "volume", "spotify", "media_path", "media_paths", "fs_kind", "spot_delay", "help", "warn_ack"}
 
 
 def presets_path():
@@ -3728,7 +3742,7 @@ class Panel:
         text(d["title"], x + 28, y + 22, 20, WHITE, True)
         cy = y + 62
         for i, ln in enumerate(lines):
-            text(ln, x + 28, cy, 14, WHITE, maxw=bw - 56, al=255 if i == 0 else DIM_AL + 50)
+            text(ln, x + 28, cy, 14, WHITE, maxw=bw - 56, al=255 if (i == 0 or d.get("kind") == "warning") else DIM_AL + 50)
             cy += 22
         if items:
             sc = d["scroll"]
@@ -3745,10 +3759,11 @@ class Panel:
                 self.vbar(hits, box, hover, "dlg", x + bw - 22, cy, th, bh2, sc, len(items) - DLG_ROWS)
         bs = d["buttons"]
         if bs:
-            tot = len(bs) * 160 - 10
+            bwd = 230 if d.get("kind") == "warning" else 150
+            tot = len(bs) * (bwd + 10) - 10
             bx = x + bw - 24 - tot
             for k, (lab, prim, dg) in enumerate(bs):
-                button(bx + k * 160, y + bh - 56, 150, 38, lab, ("dlg", k), prim, 14, True, r=14, danger=dg and not prim)
+                button(bx + k * (bwd + 10), y + bh - 56, bwd, 38, lab, ("dlg", k), prim, 14, True, r=14, danger=dg and not prim)
 
     def render(self, st, W, H, hover, tab, scroll):
         s = self.scale(W, H)
@@ -6765,6 +6780,26 @@ class App:
         self.dlg = dict(title=title, lines=lines, items=items, buttons=buttons, scroll=0, kind=kind, busy=False)
         self.dlg_ver += 1
 
+    def warn_needed(self):
+        return self.cfg.get("warn_ack", "") != WARN_VERSION
+
+    def warn_show(self):
+        """Health warning: nothing in the app can be used until it's accepted (or the app is closed)."""
+        import textwrap
+        lines = []
+        for para in WARN_PARAS:
+            lines += textwrap.wrap(para, 84) + [" "]
+        lines.pop()
+        if not self.menu_open:
+            self.open_menu(True)                                  # drawn on the menu panel; the live visuals stay hidden behind it
+        self.dlg_open(WARN_TITLE, lines, [], [("Exit", lambda: setattr(self, "exit_at", time.perf_counter()), False),
+                                              ("I understand and accept", self.warn_accept, True)], kind="warning")
+
+    def warn_accept(self):
+        self.cfg["warn_ack"] = WARN_VERSION
+        save_settings(self.cfg)
+        log("health warning accepted (v" + WARN_VERSION + ")")
+
     def dlg_press(self, i):
         d = self.dlg
         if not d or not (0 <= i < len(d["buttons"])):
@@ -6827,7 +6862,7 @@ class App:
         if not d:
             return None
         return dict(title=d["title"], lines=d["lines"], items=d["items"], scroll=d["scroll"],
-                    buttons=[(b[0], b[2], len(b) > 3 and bool(b[3])) for b in d["buttons"]], busy=d["busy"])
+                    buttons=[(b[0], b[2], len(b) > 3 and bool(b[3])) for b in d["buttons"]], busy=d["busy"], kind=d.get("kind", "plain"))
 
     def proj_poll(self):
         while self.proj_inbox:
@@ -8146,7 +8181,7 @@ class App:
     def handle_key(self, k, now):
         a, cfg = self.audio, self.cfg
         if self.dlg:
-            if k == pygame.K_ESCAPE:
+            if k == pygame.K_ESCAPE and self.dlg.get("kind") != "warning":      # the health warning can only be accepted or the app closed
                 self.dlg_cancel()
             return
         if k == pygame.K_ESCAPE and self.menu_open and self.tab == "home" and not self.in_session:
@@ -8282,6 +8317,8 @@ class App:
             self.refresh_home()
             self.tab = self.tab_seen = "home"
             self.open_menu(True)
+        if self.warn_needed():
+            self.warn_show()                                   # first launch (or a new warning version): must be accepted before anything else
 
         while self.running:
             now = time.perf_counter()
