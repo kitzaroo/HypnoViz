@@ -2,9 +2,10 @@
 
 A trippy music visualizer for Windows. Drop in a song and a spiral reacts to the bass, kicks and snares. Drop in videos, GIFs or images and they blend into the visuals and change scene on the beat.
 
-![The visual styles: Classic, Neon, Kaleidoscope and Psychedelic](screenshots/styles.jpg)
+![All 18 visual styles](screenshots/styles.jpg)
+*The 18 styles, left to right and top to bottom: Media (the built-in example clip), Classic, Prism, Neon, Kaleidoscope, Psychedelic, Tunnel, Vortex, Plasma, Ripples, Synthwave, Warp, Honeycomb, Julia, Lava, Aurora, Sunburst and Smoke.*
 
-- 18 visual styles: Media (first), Classic, Prism, Neon, Kaleidoscope, Psychedelic, then Tunnel, Vortex, Plasma, Ripples, Synthwave, Warp, Honeycomb, Julia, Lava, Aurora, Sunburst and Smoke. Media is footage only (footage only; with an empty stack it plays a built-in example clip: a spinning 3D "VIDEO EXAMPLE" that bounces around like the DVD idle logo, over 5 different animated backgrounds that act as scenes, so every media effect, scene jump and transition shows without a real clip. The Media card in the style picker shows it too, including on hover. It disappears as soon as a real clip is added and comes back when the stack is empty again)
+- 18 visual styles: Media (first), Classic, Prism, Neon, Kaleidoscope, Psychedelic, then Tunnel, Vortex, Plasma, Ripples, Synthwave, Warp, Honeycomb, Julia, Lava, Aurora, Sunburst and Smoke. Media shows your footage only (with an empty stack it plays a built-in example clip: a spinning 3D "VIDEO EXAMPLE" that bounces around like the DVD idle logo, over 5 different animated backgrounds that act as scenes, so every media effect, scene jump and transition shows without a real clip. The Media card in the style picker shows it too, including on hover. It disappears as soon as a real clip is added and comes back when the stack is empty again)
 - Media layer: stack videos, GIFs and images; scene changes on the beat, kick or snare; optional smooth video (in-between frames) and camera sway
 - Scene manager: preview every detected scene in a clip, trim it, hide or delete the ones you don't want
 - A home screen with your saved projects (with snapshots), a missing-files check when you open one, and save / load in Settings
@@ -49,7 +50,7 @@ If something goes wrong, the console window stays open and shows the error. The 
 
 1. Run `run.bat`. You start on the **home screen**: open a saved project, start a new one, or drag music files onto the window.
 2. Drag a music file (mp3, wav, flac, ogg, m4a, aac, opus, ...) onto the window. Drag videos, GIFs or images on as well to add them to the media stack.
-3. Press **Esc** to open the glass menu. It fades in with a blur, and every page shares the player bar at the bottom.
+3. Press **Esc** to open the glass menu. It fades in with a blur, and every page shares the player bar at the bottom. The header has the tabs, a **home** button (back to the home screen) and a **save** button (save the project).
 
 ### Home screen and projects
 
@@ -84,7 +85,7 @@ The app opens on a glass **home screen**. It lists your recent projects as cards
 
 - *Visual style*: the style cards in one row. Scroll the row with the mouse wheel (over it) or drag the scroll bar under it (every list's scroll bar can be grabbed and dragged too: page, queue, scenes, media stack, projects); cards blur and fade at the row's edges as they scroll in and out. Hover a card and it plays a short looping demo of that style.
 - *Live preview*: a mirror of what's on screen. Scroll down and it blurs away, then blurs back in as a mini preview in the bottom left of the player bar (over the art and song name), so you can keep watching it while you edit the sliders below. Scroll back up and it hands itself back.
-- *Motion & effects*: spin, bass zoom, bass distortion, chromatic aberration, smoothing, colour drift, beat pulse (how hard the media layer pulses with the bass) and (only while Domination mode is on) the Domination text size / rate sliders. **Bass zoom style** picks how the Bass zoom slider moves the picture: **Centered zoom**, **Shaky zoom** (the zoom trembles, harder the further in it goes) or **Random area zoom** (each new bass swell glides the zoom toward a different spot on the screen). **Bass distortion style** picks what the Bass distortion slider (just under Bass zoom) does on every bass / kick hit: **Blur**, **Vibrate**, **Glitch** (the Domination banner's tearing, inverted bars and colour split, across the whole screen) or **Random** (a different one on each hit). The slider sets how strong it is and starts at 100% (0% turns it off). Every effect slider has a light on its left: click it to switch that effect off (the slider greys out and the effect counts as zero; Domination size / rate count as 100%) and click again to turn it back on. The Kaleidoscope zoom speed slider only shows while the Kaleidoscope style is selected. Under the **Media effects** heading are the media blend mode (spiral window, soft overlay, glow), beat-reactive opacity, kick/snare burst and flash, camera sway, scene change rate, transition style and **Smooth video**.
+- *Motion & effects*: spin, bass zoom, bass distortion, chromatic aberration, smoothing, colour drift, beat pulse (how hard the media layer pulses with the bass) and (only while Domination mode is on) the Domination text size / rate sliders. **Bass zoom style** picks how the Bass zoom slider moves the picture: **Centered zoom**, **Shaky zoom** (the zoom trembles, harder the further in it goes) or **Random area zoom** (each new bass swell glides the zoom toward a different spot on the screen). **Bass distortion style** picks what the Bass distortion slider (just under Bass zoom) does on every bass / kick hit: **Blur**, **Vibrate**, **Glitch** (the Domination banner's tearing, inverted bars and colour split, across the whole screen) or **Random** (a different one on each hit). The slider sets how strong it is and starts at 100% (0% turns it off). Every effect slider has a light on its left: click it to switch that effect off (the slider greys out and the effect counts as zero; Domination size / rate count as 100%) and click again to turn it back on. The Kaleidoscope zoom speed slider only shows while the Kaleidoscope style is selected. New projects start with Spin response 40%, Bass distortion 100%, Colour drift 300% and Scene change rate 30%. Under the **Media effects** heading are the media blend mode (spiral window, soft overlay, glow), beat-reactive opacity, kick/snare burst and flash, camera sway, scene change rate, transition style and **Smooth video**.
 - *Media & stack*: the current clip with **Add files...**, **Scenes...** and the **Media layer** on/off switch, plus the stack of every clip. Click a clip to jump to it.
 
 ![Visuals](screenshots/visuals.jpg)
@@ -100,6 +101,10 @@ The app opens on a glass **home screen**. It lists your recent projects as cards
 
 ![Scenes](screenshots/scenes.jpg)
 
+While a new video is scanned, the "Loading Scenes" cover takes over the screen:
+
+![The Loading Scenes cover](screenshots/loading.jpg)
+
 **Beat**: a live spectrum with the kick and snare bands. Tune the ranges and sensitivities until KICK and SNARE flash only on the real drums.
 
 ![Beat](screenshots/beat.jpg)
@@ -108,7 +113,7 @@ The app opens on a glass **home screen**. It lists your recent projects as cards
 
 ![Export](screenshots/export.jpg)
 
-**Settings**: the **Domination Mode** and **Spotify Mode** switches, display mode (windowed, borderless, exclusive fullscreen), help hints, remembering your media on startup, the Spotify sync delay, the **Project** box (**Save project**, **Save as...**, **Load project...**, **Home**), presets (save, update, delete) and **Reset all settings**. The keys are listed in a single line under the Project box and in the table below.
+**Settings**: the **Domination Mode** and **Spotify Mode** switches, display mode (windowed, borderless, exclusive fullscreen), help hints, remembering your media on startup, the Spotify sync delay, the **Project** box (**Save project**, **Save as...**, **Load project...**, **Home**), presets (save, update, delete) **Reset all settings** and **Clear all scene cache**. The keys are listed in a single line under the Project box and in the table below.
 
 ![Settings](screenshots/settings.jpg)
 
@@ -151,7 +156,7 @@ In Spotify Mode the player bar shows Spotify's song, artist and album art, and:
 | X | Hide the scene on screen (it never plays again; menu closed) |
 | Delete | Delete the scene on screen (menu closed) |
 | Z | Undo the last hide / delete (menu closed) |
-| Mouse wheel (menu > Visuals) | Scroll the page; Ctrl + wheel over a slider nudges it |
+| Mouse wheel (menu > Visuals) | Scroll the page; over the style cards it scrolls the row sideways; Ctrl + wheel over a slider nudges it |
 | D | Domination Mode |
 | S | Spotify Mode |
 | N / P | Next / previous track |
@@ -164,7 +169,7 @@ Your settings, presets, trims, hidden/deleted scenes, the recent-projects list a
 
 ## Building a standalone .exe
 
-Double-click `build_exe.bat`. When it finishes, the app is in `dist\Hypnosis\Hypnosis.exe`.
+Double-click `build_exe.bat` (the exe gets the spiral icon from `hypnosis_icon.ico`). When it finishes, the app is in `dist\Hypnosis\Hypnosis.exe`.
 
 Keep the whole `dist\Hypnosis` folder together: `Hypnosis.exe` needs the `_internal` folder next to it (and `spotify_icon.png`, which the build copies there). To share it, zip that folder. The people you share it with need **no** Python and no setup, they just unzip it and run `Hypnosis.exe`.
 
